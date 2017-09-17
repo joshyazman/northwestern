@@ -1,0 +1,692 @@
+---
+title: "PREDICT 422 - Final Project"
+output:
+  html_document: default
+  word_document: default
+---
+
+OBJECTIVES: A charitable organization wishes to develop a machine learning model to improve the cost-effectiveness of their direct marketing campaigns to previous donors.
+
+For this project, five classification and five prediction models are fitted to a training dataset of 1,995 observations and a test set of 999 observations of charity donors. The highest performing models are used to predict the donation likelihoods and amounts of a test set of 2,007 potential donors. 
+
+1) Develop a classification model using data from the most recent campaign that can effectively capture likely donors so that the expected net profit is maximized.
+
+The five classification models tested are linear discriminant analysis (LDA), logistic regression, quadratic distriminant analysis, the classification trees and a boosted classification tree. Models are evaluated by their predictive accuracy and maximum profit per capita.  
+
+2) Develop a prediction model to predict donation amounts for donors - the data for this will consist of the records for donors only.
+
+The five prediction models are OLS regression, principal components regression, regression splines, regression with backward stepwise variable selection, and boosted regression trees. Models are evaluated by mean squared error (MSE).
+
+```{r, echo = FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(error = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = TRUE)
+
+## Set-Up and Exploratory Analysis
+# Start by taking some steps to set up data frames for use in the rest of the project and explore the data.
+
+# load the data
+setwd('C:/Users/joshy/Google Drive/northwestern/PREDICT-422/general-docs/final-project/')
+charity <- read.csv('charity.csv') # load the "charity.csv" file
+# install_github('yaztheme','joshyazman')
+library(yaztheme)
+library(MASS)
+library(gridExtra)
+library(ggjoy)
+library(dplyr)
+library(ggplot2)
+
+# predictor transformations
+charity.t <- charity%>%
+  mutate(avhv = log(avhv), 
+         incm = log(incm))
+# for example, some statistical methods can struggle when predictors are highly skewed
+
+# set up data for analysis
+data.train <- charity.t[charity$part=="train",]
+x.train <- data.train[,2:21]
+c.train <- data.train[,22] # donr
+n.train.c <- length(c.train) # 3984
+y.train <- data.train[c.train==1,23] # damt for observations with donr=1
+n.train.y <- length(y.train) # 1995
+
+data.valid <- charity.t[charity$part=="valid",]
+x.valid <- data.valid[,2:21]
+c.valid <- data.valid[,22] # donr
+n.valid.c <- length(c.valid) # 2018
+y.valid <- data.valid[c.valid==1,23] # damt for observations with donr=1
+n.valid.y <- length(y.valid) # 999
+
+data.test <- charity.t[charity$part=="test",]
+n.test <- dim(data.test)[1] # 2007
+x.test <- data.test[,2:21]
+
+x.train.mean <- apply(x.train, 2, mean)
+x.train.sd <- apply(x.train, 2, sd)
+x.train.std <- scale(x.train) # standardize to have zero mean and unit sd
+# apply(x.train.std, 2, mean) # check zero mean
+# apply(x.train.std, 2, sd) # check unit sd
+data.train.std.c <- data.frame(x.train.std, donr=c.train) # to classify donr
+data.train.std.y <- data.frame(x.train.std[c.train==1,], damt=y.train) # to predict damt when donr=1
+
+x.valid.std <- t((t(x.valid)-x.train.mean)/x.train.sd) # standardize using training mean and sd
+data.valid.std.c <- data.frame(x.valid.std, donr=c.valid) # to classify donr
+data.valid.std.y <- data.frame(x.valid.std[c.valid==1,], damt=y.valid) # to predict damt when donr=1
+
+x.test.std <- t((t(x.test)-x.train.mean)/x.train.sd) # standardize using training mean and sd
+data.test.std <- data.frame(x.test.std)
+
+```
+
+# Classification Models
+```{r, echo = FALSE}
+class.method <- c()
+max.profit <- c()
+opt.cutoff <- c()
+predictive.accuracy <- c()
+cost.per.error <- c()
+```
+
+This set of models will seek to determine whether or not a given observation should receive a mailer by assigning a donation-propensity score and finding an optimal cutoff. Five classification models are attempted with model health compared at the end of this section.
+
+## Linear Discriminant Analysis (LDA)
+LDA models the distributions of various predictors separately and then approximates Bayesian classifiers to predict classes. The LDA model for charitable donations was trained on all variables except for ID and donation amount. Distributions of posterior probabilities within known classes of observations from the validation set illustrate a fairly strong bifurcation between scores. 
+
+Non-donors skew towards lower probabilities and donors skew towards higher values (Figure 1.1). The proportion of observations who donated are plotted against donation-propensity scores. There is a fairly strong positive relationship between predicted likelihood of donation and actual likelihood (Figure 1.2).
+
+```{r, echo=FALSE, fig.height = 3, fig.width= 11}
+class.method[1] <- 'Linear Discriminant Analysis'
+lda.fit <- lda(donr ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + + genf + wrat + 
+                    avhv + incm + inca + plow + npro + tgif + lgif + rgif + tdon + tlag +
+                    agif, 
+               data.train.std.c) 
+lda.preds <- bind_cols(
+  data.frame(donor.orig = data.valid.std.c$donr,
+             lda.pred = predict(lda.fit, data.valid.std.c)$class,
+             post.prob = predict(lda.fit, data.valid.std.c)$posterior[,2])
+  )
+lda.dist <- ggplot(lda.preds, aes(x = post.prob, fill = as.character(donor.orig)))+
+  # geom_histogram(fill = yaz_cols[1], alpha = .75, bandwidth = .02)+
+  geom_density(alpha = .75)+
+  labs(title = 'Fig 1.1: LDA Donation Likelihood',
+       y = 'Frequency',
+       x = 'Donation Likelihood Score',
+       subtitle = 'Predicted values in the verification set.')+
+  theme_yaz(base_size = 10)+
+  scale_fill_manual(values = yaz_cols[4:5], name = 'Validated Classification', labels = c('Non-Donor','Donor'))
+
+viz.df <- lda.preds%>%
+  mutate(rounded.prob = round(post.prob,2))%>%
+  group_by(rounded.prob)%>%
+  summarise(mean.orig = mean(donor.orig),
+            n = n())
+
+lda.scat <- ggplot(viz.df, aes(rounded.prob, mean.orig, size = n))+
+  geom_point(alpha = .5)+
+  labs(title = 'Fig 1.2: LDA Score Accuracy',
+       x = 'Predicted Probability',
+       y = 'Proportion Who Are Donors')+
+  geom_abline(intercept = 0,slope = 1)+
+  theme_yaz(base_size = 10)
+
+# Calculate the profit derived from the model
+profits.optim <- lda.preds%>%
+  arrange(desc(post.prob))%>%
+  mutate(profit = ifelse(lda.pred == 1, 12.5, -2),
+         cum.prof = cumsum(profit))
+
+max.prof <- max(profits.optim$cum.prof)
+max.profit[1] <- round(max.prof/nrow(data.valid.std.c),2)
+opt.cut.df <- profits.optim%>%filter(cum.prof == max.prof)%>%dplyr::select(post.prob)
+opt.cut <- opt.cut.df[1,1]
+opt.cutoff[1] <- opt.cut
+cm <- table(True = lda.preds$donor.orig, Predicted = lda.preds$lda.pred)
+predictive.accuracy[1] <- (cm[1,1]+cm[2,2])/(cm[1,1]+cm[2,2]+cm[1,2]+cm[2,1])
+cost.per.error[1] <- ((cm[1,2]*2)+ (cm[2,1]*12.5))/(cm[2,1]+cm[1,2])
+
+lda.cut <- ggplot(profits.optim, aes(x = post.prob, y = cum.prof))+
+  geom_line(color = yaz_cols[1], size = 2)+
+  labs(x = 'Posterior Probability',
+       y = 'Cumulative Profit',
+       title = 'Fig 1.3: LDA Optimal Cutoff')+
+  theme_yaz(base_size = 10)+
+  annotate('text', x = opt.cut-0.13, 
+           y = max.prof-3500, 
+           label = paste0('Profit Per Cap: $', round(max.prof/nrow(data.valid.std.c),2),
+                          '\nOptimal Cutoff: ', round(opt.cut,2)))
+
+grid.arrange(lda.dist, lda.scat, lda.cut,nrow = 1)
+```
+
+The predictive accuracy is 83.7% when the model is applied to the validation set. The optimal cutoff for the data is the point at which the model predicts as many true positives as is profitable. That can be determined by plotting cumulative profit against potential cutoffs. At 0.50 the model maximizes profits earning the charity $6.81 per piece (Figure 1.3). 
+
+## Logistic Regression
+In logistic regression, we attempt to assign a conditional probability of donation given a set of input variables. This model uses home ownership, number of children in household, wealth rating, median household income in the potential donor's neighborhood, lifetime number of promotions received, total gifts given to date, time since last donation, and the time between first and second donations. 
+
+The scores are less neatly split than the LDA model but still generally skew towards lower scores for non-donors in the validation set and higher scores for donors (Figure 2.1). Again there is a strong positive relationship between predictions and reality (Figure 2.2).
+```{r, echo=FALSE, fig.height = 3, fig.width= 11}
+class.method[2] <- 'Logistic Regression'
+model.log1 <- glm(donr ~ home + chld + wrat + incm + npro + tgif + tdon + tlag, 
+                  data.train.std.c, family=binomial("logit"))
+# summary(model.log1)
+preds <- predict(model.log1, data.valid.std.c, type="response")
+
+log1.preds <- bind_cols(
+  data.frame(donor.orig = data.valid.std.c$donr,
+             preds)
+  )
+log.dist <- ggplot(log1.preds, aes(x = preds, fill = as.character(donor.orig)))+
+    # geom_histogram(fill = yaz_cols[1], alpha = .75, bandwidth = .02)+
+    geom_density(alpha = .75)+
+    labs(title = 'Fig 2.1: Log. Reg Donation Prop.',
+         y = 'Frequency',
+         x = 'Donation Likelihood Score',
+         subtitle = 'Predicted values in the verification set.')+
+    theme_yaz(base_size = 10)+
+    scale_fill_manual(values = yaz_cols[4:5], name = 'Validated Classification', labels = c('Non-Donor','Donor'))
+
+viz.df <- log1.preds%>%
+  mutate(rounded.prob = round(preds,2))%>%
+  group_by(rounded.prob)%>%
+  summarise(mean.orig = mean(donor.orig),
+            n = n())
+
+log.scat <- ggplot(viz.df, aes(rounded.prob, mean.orig, size = n))+
+    geom_point(alpha = .5)+
+    labs(title = 'Fig 2.2: Log. Reg. Score Accuracy',
+         x = 'Predicted Probability',
+         y = 'Proportion Who Are Donors',
+         subtitle = 'Predicted values in the verification set.')+
+    geom_abline(intercept = 0,slope = 1)+
+    theme_yaz(base_size = 10)
+
+# Calculate the profit derived from the model
+profits.optim <- log1.preds%>%
+  arrange(desc(preds))%>%
+  mutate(profit = ifelse(donor.orig == 1, 12.5, -2),
+         cum.prof = cumsum(profit))
+
+max.prof <- max(profits.optim$cum.prof)
+max.profit[2] <- max.prof/nrow(data.valid.std.c)
+opt.cut.df <- profits.optim%>%filter(cum.prof == max.prof)%>%dplyr::select(preds)
+opt.cut <- opt.cut.df[1,1]
+opt.cutoff[2] <- opt.cut
+log.cut <- ggplot(profits.optim, aes(x = preds, y = cum.prof))+
+  geom_line(color = yaz_cols[1], size = 2)+
+  labs(x = 'Posterior Probability',
+       y = 'Cumulative Profit',
+       title = 'Fig 2.3: Log. Reg. Optimal Cutoff')+
+  theme_yaz(base_size = 10)+
+  annotate('text', x = opt.cut+.15,
+           y = max.prof-4000, 
+           label = paste0('Profit Per Cap: $', round(max.prof/nrow(data.valid.std.c),2),
+                          '\nOptimal Cutoff: ', round(opt.cut,2)))
+
+cm <- table(log1.preds$donor.orig, ifelse(log1.preds$preds> opt.cut,1,0))
+predictive.accuracy[2] <- (cm[1,1]+cm[2,2])/(cm[1,1]+cm[2,2]+cm[1,2]+cm[2,1])
+cost.per.error[2] <- ((cm[1,2]*2)+ (cm[2,1]*12.5))/(cm[2,1]+cm[1,2])
+
+grid.arrange(log.dist, log.scat, log.cut,nrow = 1)
+```
+Profit is maximized in this model at a score of 0.13 because there are more scores in the middle of the distribution that make classification choices more ambiguous. Despite that added uncertainty, mailing to these people is still revenue positive because enough of them to contribute to make up for the increased Type I error. Using that cutoff, the predictive accuracy of this model is 70% with the bulk of errors being false positives. The bright side of that error number is that false positives incur lower expenses from mailing than false negatives do from opportunity cost of not mailing a likely donor. 
+
+## Quadratic Discriminant Analysis
+Quadratic Discriminant Analysis works similarly to LDA, but uses class-specific covariance matrices rather than one common covariance matrix. The implication is that QDA can potentially reduce bias, but at the same time risks increased variance. 
+
+The model produces a neat distribution of classification probabilities with most observations skewed towards the end. More observations appear to cluster towards 1 than 0 with relatively few in the middle (Figure 3.1). Comparing scores to real probabilities indicates potential for significant error in the middle of the distribution. Additionally, this model appears to overpredict donation likelihood at the high end of the distribution and underpredict non-donation likelihood at the low end (Figure 3.2). 
+
+```{r, echo=FALSE, fig.height = 3, fig.width= 11}
+class.method[3] = 'Quadratic Discriminant Analysis'
+qda.fit <- qda(donr ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + genf + wrat + 
+                 avhv + incm + inca + plow + npro + tgif + lgif + rgif + tdon + tlag + agif, 
+               data.train.std.c)
+
+preds <- predict(qda.fit, data.valid.std.c)
+
+qda.preds <- data.frame(
+  donor.orig = data.valid.std.c$donr,
+  preds = predict(qda.fit, data.valid.std.c)$class,
+  post.prob = predict(qda.fit, data.valid.std.c)$posterior[,2]
+  )
+
+qda.dist <- ggplot(qda.preds, aes(x = post.prob, fill = as.character(donor.orig)))+
+    # geom_histogram(fill = yaz_cols[1], alpha = .75, bandwidth = .02)+
+    geom_density(alpha = .75)+
+    labs(title = 'Fig 3.1: QDA Donation Prop.',
+         y = 'Frequency',
+         x = 'Donation Likelihood Score',
+         subtitle = 'Predicted values in the verification set.')+
+    theme_yaz(base_size = 10)+
+    scale_fill_manual(values = yaz_cols[4:5], name = 'Validated Classification', labels = c('Non-Donor','Donor'))
+
+viz.df <- qda.preds%>%
+  mutate(round.probs = round(post.prob,2))%>%
+  group_by(round.probs)%>%
+  summarise(actual = mean(donor.orig),
+            n = n())
+
+qda.scat <- ggplot(viz.df, aes(round.probs, actual, size = n))+
+    geom_point(alpha = .75)+
+    labs(title = 'Fig 3.2: QDA Score Accuracy',
+         x = 'Predicted Probability',
+         y = 'Proportion Who Are Donors',
+         subtitle = 'Predicted values in the verification set.')+
+    geom_abline(intercept = 0,slope = 1)+
+    theme_yaz(base_size = 10)
+
+# Calculate the profit derived from the model
+profits.optim <- qda.preds%>%
+  arrange(desc(post.prob))%>%
+  mutate(profit = ifelse(donor.orig == 1, 12.5, -2),
+         cum.prof = cumsum(profit))
+
+max.prof <- max(profits.optim$cum.prof)
+max.profit[3] <- max.prof/nrow(data.valid.std.c)
+opt.cut.df <- profits.optim%>%filter(cum.prof == max.prof)%>%dplyr::select(post.prob)
+opt.cut <- opt.cut.df[1,1]
+opt.cutoff[3] <- opt.cut
+qda.cut <- ggplot(profits.optim, aes(x = post.prob, y = cum.prof))+
+  geom_line(color = yaz_cols[1], size = 2)+
+  labs(x = 'Posterior Probability',
+       y = 'Cumulative Profit',
+       title = 'Fig 3.3: Log. Reg. Optimal Cutoff')+
+  theme_yaz(base_size = 10)+
+  annotate('text', x = opt.cut+.15,
+           y = max.prof-3000, 
+           label = paste0('Profit Per Cap: $', round(max.prof/nrow(data.valid.std.c),2),
+                          '\nOptimal Cutoff: ', round(opt.cut,2)))
+
+cm <- table(qda.preds$donor.orig, ifelse(qda.preds$post.prob> opt.cut,1,0))
+predictive.accuracy[3] <- (cm[1,1]+cm[2,2])/(cm[1,1]+cm[2,2]+cm[1,2]+cm[2,1])
+cost.per.error[3] <- ((cm[1,2]*2)+ (cm[2,1]*12.5))/(cm[2,1]+cm[1,2])
+
+grid.arrange(qda.dist, qda.scat, qda.cut, nrow = 1)
+```
+
+Similar to Logistic Regression, QDA produces a very low optimal cutoff score of 0.13. Using that cutoff score yields a maximum per capita profit of $5.58 (Figure 3.4) and a predictive accuracy of 79%. 
+
+## Classification Tree
+Classification trees use recursive binary splitting to divide observations until some terminal set of divisions is achieved. Each resulting group is assigned a classification based on the most common classification in it's terminal node.
+
+Donation likelihood scores produced by the basic classification tree are not as smooth and continuous as previous models because each observation within a terminal node has the same probability. That said, the model has fairly distinct classifications for non-donors but more variation in scores for donors (Figure 4.1). Those predictions appear to line up quite well with real probabilities particularly towards either extreme of the distribution (Figure 4.2). 
+```{r, echo=FALSE, fig.height = 3, fig.width= 11}
+class.method[4] = 'Basic Classification Tree'
+library(tree)
+tree.fit <- tree(as.factor(donr) ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + genf + wrat + 
+                   avhv + incm + inca + plow + npro + tgif + lgif + rgif + tdon + tlag + agif, 
+                 data.train.std.c)
+
+preds <- predict(tree.fit, data.valid.std.c)#, type = 'class') Got the posterior probs to calculate optimal cut
+
+tree.preds <- data.frame(
+  donor.orig = data.valid.std.c$donr,
+  post.prob = preds[,2]
+  )
+
+tree.dist <- ggplot(tree.preds, aes(x = post.prob, fill = as.character(donor.orig)))+
+    # geom_histogram(fill = yaz_cols[1], alpha = .75, bandwidth = .02)+
+    geom_density(alpha = .75)+
+    labs(title = 'Fig 4.1: Trees Donation Prop.',
+         y = 'Frequency',
+         x = 'Donation Likelihood Score',
+         subtitle = 'Predicted values in the verification set.')+
+    theme_yaz(base_size = 10)+
+    scale_fill_manual(values = yaz_cols[4:5], name = 'Validated Classification', labels = c('Non-Donor','Donor'))
+
+viz.df <- tree.preds%>%
+  mutate(round.probs = round(post.prob,2))%>%
+  group_by(round.probs)%>%
+  summarise(actual = mean(donor.orig),
+            n = n())
+tree.scat <- ggplot(viz.df, aes(round.probs, actual, size = n))+
+    geom_point(alpha = .5)+
+    labs(title = 'Fig 4.2: Trees Score Accuracy',
+         x = 'Predicted Probability',
+         y = 'Proportion Who Are Donors',
+         subtitle = 'Predicted values in the verification set.')+
+    geom_abline(intercept = 0,slope = 1)+
+    theme_yaz(base_size = 10)
+
+# Calculate the profit derived from the model
+profits.optim <- tree.preds%>%
+  arrange(desc(post.prob))%>%
+  mutate(profit = ifelse(donor.orig == 1, 12.5, -2),
+         cum.prof = cumsum(profit))
+
+max.prof <- max(profits.optim$cum.prof)
+max.profit[4] <- max.prof/nrow(data.valid.std.c)
+opt.cut.df <- profits.optim%>%filter(cum.prof == max.prof)%>%dplyr::select(post.prob)
+opt.cut <- opt.cut.df[1,1]
+opt.cutoff[4] <- opt.cut
+tree.cut <- ggplot(profits.optim, aes(x = post.prob, y = cum.prof))+
+  geom_line(color = yaz_cols[1], size = 2)+
+  labs(x = 'Posterior Probability',
+       y = 'Cumulative Profit',
+       title = 'Fig 2.3: Trees Optimal Cutoff')+
+  theme_yaz(base_size = 10)+
+  annotate('text', x = opt.cut+.15,
+           y = max.prof-3000, 
+           label = paste0('Profit Per Cap: $', round(max.prof/nrow(data.valid.std.y),2),
+                          '\nOptimal Cutoff: ', round(opt.cut,2)))
+
+cm <- table(tree.preds$donor.orig, ifelse(tree.preds$post.prob> opt.cut,1,0))
+predictive.accuracy[4] <- (cm[1,1]+cm[2,2])/(cm[1,1]+cm[2,2]+cm[1,2]+cm[2,1]) # 81%
+cost.per.error[4] <- ((cm[1,2]*2)+ (cm[2,1]*12.5))/(cm[2,1]+cm[1,2])
+
+grid.arrange(tree.dist, tree.scat, tree.cut, nrow = 1)
+```
+
+The optimal cutoff probability is 0.14 and profit is maximized at $5.56 per person (Figure 4.4). At that cutoff, the predictive accuracy is 81%.
+
+## Boosted Classification Tree
+Boosting trees involves sequentially growing multiple trees and combining the scores from each tree to produce classification probabilities. 
+
+Classifications are bifurcated neatly with most donors' scores skewed towards 1 and non-donors' scores skewed towards 0 (Figure 5.1). But that bifurcation might mean that scores near zero under-represent true donation propensity and scores closer to 1 overstate true donation propensity compared to true proportions (Figure 5.2).
+```{r, echo=FALSE, fig.height = 3, fig.width= 11, error = TRUE}
+class.method[5] = 'Boosted Classification Tree'
+library(gbm)
+boost.donr <- gbm(donr ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + genf + wrat + 
+                   avhv + incm + inca + plow + npro + tgif + lgif + rgif + tdon + tlag + agif, 
+                 data.train.std.c, distribution = 'bernoulli',n.trees=5000, interaction.depth=4)
+
+preds <- predict(boost.donr, data.valid.std.c,n.trees=5000, type = 'response')
+boosted.preds <- data.frame(
+  donor.orig = data.valid.std.c$donr,
+  post.prob = preds
+  )
+
+boost.dist <- ggplot(boosted.preds, aes(x = post.prob, fill = as.character(donor.orig)))+
+  # geom_histogram(fill = yaz_cols[1], alpha = .75, bandwidth = .02)+
+  geom_density(alpha = .75)+
+  labs(title = 'Fig 5.1: Boosted Tree Donation Prop.',
+       y = 'Frequency',
+       x = 'Donation Likelihood Score',
+       subtitle = 'Predicted values in the verification set.')+
+  theme_yaz(base_size = 10)+
+  scale_fill_manual(values = yaz_cols[4:5], name = 'Validated Classification', labels = c('Non-Donor','Donor'))
+
+viz.df <- boosted.preds%>%
+  mutate(round.probs = round(post.prob,2))%>%
+  group_by(round.probs)%>%
+  summarise(actual = mean(donor.orig),
+            n = n())
+
+boost.scat <- ggplot(viz.df, aes(round.probs, actual, size = n))+
+  geom_point(alpha = .5)+
+  labs(title = 'Fig 5.2: Boosted Tree Score Accuracy',
+       x = 'Predicted Probability',
+       y = 'Proportion Who Are Donors',
+       subtitle = 'Predicted values in the verification set.')+
+  geom_abline(intercept = 0,slope = 1)+
+  theme_yaz(base_size = 10)
+
+# Calculate the profit derived from the model
+profits.optim <- boosted.preds%>%
+  arrange(desc(post.prob))%>%
+  mutate(profit = ifelse(donor.orig == 1, 12.5, -2),
+         cum.prof = cumsum(profit))
+
+max.prof <- max(profits.optim$cum.prof)
+max.profit[5] <- max.prof/nrow(data.valid.std.c)
+opt.cut.df <- profits.optim%>%filter(cum.prof == max.prof)%>%dplyr::select(post.prob)
+opt.cut <- opt.cut.df[1,1]
+opt.cutoff[5] <- opt.cut
+boost.cut <- ggplot(profits.optim, aes(x = post.prob, y = cum.prof))+
+  geom_line(color = yaz_cols[1], size = 2)+
+  labs(x = 'Posterior Probability',
+       y = 'Cumulative Profit',
+       title = 'Fig 5.3: Boosted Tree Optimal Cutoff')+
+  theme_yaz(base_size = 10)+
+  annotate('text', x = opt.cut, y = max.prof-3000, 
+           label = paste0('Profit Per Cap: $', round(max.profit[5],2),
+                          '\nOptimal Cutoff: ', round(opt.cut,2)))
+
+cm <- table(boosted.preds$donor.orig, ifelse(boosted.preds$post.prob> opt.cut,1,0))
+predictive.accuracy[5] <- (cm[1,1]+cm[2,2])/(cm[1,1]+cm[2,2]+cm[1,2]+cm[2,1]) # 81%
+cost.per.error[5] <- ((cm[1,2]*2)+ (cm[2,1]*12.5))/(cm[2,1]+cm[1,2]) # $11.63
+
+
+grid.arrange(boost.dist, boost.scat, boost.cut, nrow = 1)
+```
+
+The optimal cutoff point for mailings based on the boosted tree model is 0.34 which yields a per capita profit of $5.87 (Figure 5.3) and a predictive accuracy of 87%. 
+
+## Evaluating classification models
+LDA performed most effectively in terms of maximizing per capita profit at $6.81 per mailer. Since this is teh preferred evaluation method requested by the client, the LDA model should be used as the final predictor. That said, it's worth examining a few other statistics about each modeling technique - namely cost-per-error and predictive accuracy. When applied to the validation set, the LDA model slightly underperformed against the boosted decision tree.   
+```{r, echo = FALSE, error = TRUE}
+knitr::kable(
+  data.frame(`Method` = class.method,
+             `Max Profit` = round(max.profit,2),
+             # `Optimal Cutoff Score` = round(opt.cutoff,4)*100,
+             `Predictive Accuracy` = round(predictive.accuracy,4)*100,
+             `Cost Per Error` =  round(cost.per.error, 2)),
+  caption = paste('All calculations were made by applying the relevant model to the validation set.',
+                  'Maximum profit and cost-per-error are calculated on a per capita basis.')
+)
+```
+
+Additionally, the cost-per-error is almost twice as high as other models, indicating a propensity for the LDA model to err by excluding donors rather than including non-donors. There are downstream costs to false-negative predictions in the context of charitable engagement in the sense that donors who are excluded from one round of donation appeals may exhibit reduced donation propensities in future rounds of appeals.
+
+For the purposes of this project, the LDA model will be used so as to maximize profits, but the boosted tree should be considered in future rounds of testing and mailing if resources allow further experimentation.
+
+# Prediction Methods
+```{r, echo = FALSE}
+method <- c()
+mse <- c()
+st.error <- c()
+```
+## Multiple Linear Regression
+The first model attempting to predict donation amount is Ordinary Least Squares. This method involves plotting the response variable (known donation amount) against a set of predictors and identifying the function of a line that minimizes the distance from each point to the line. 
+```{r, echo = FALSE}
+method[1] <- 'Ordinary Least Squares'
+model.ls1 <- lm(damt ~ home + chld + hinc + incm + plow + npro + rgif + agif, 
+                data.train.std.y)
+# summary(data.train.std.y%>%dplyr::select(home, chld, hinc, incm, plow, npro, rgif, agif))
+mlr.preds <- bind_cols(
+  data.valid.std.y%>%dplyr::select(damt), 
+  data.frame(pred = predict(model.ls1, data.valid.std.y))
+  )%>%
+  mutate(pred.error = damt - pred)
+
+mse[1] <- mean(mlr.preds$pred.error^2)
+st.error[1] <- sd(mlr.preds$pred.error^2)/sqrt(nrow(data.valid.std.y))
+ols.plot <- ggplot(mlr.preds, aes(x = pred, y = damt))+
+  geom_point(size = 2, alpha = .5, color = yaz_cols[4])+
+  labs(x = 'Predicted Donation Amount',
+       y = 'Actual Amount',
+       title = 'Ordinary Least Squares Regression')+
+  theme_yaz(base_size = 10)+
+  geom_segment(aes(x = 0, xend = 25, y = 0, yend = 25))
+```
+
+## Principal Components Regression
+Principal components regression involves conducting principal components analysis and then using the most important principal components for each observation as inputs in a regression model to predict donation amount. In this case, the first nine princpal components explain 75% of the variation in the data. The first nine principal components are regressed against known donations amounts to develop the PCR model. 
+```{r, echo = FALSE, fig.height = 3, fig.width = 6}
+method <- c(method, 'Principal Components')
+pca.mod <- princomp(data.train.std.y%>%dplyr::select(-damt), cor = TRUE)
+scree.vals <- data.frame(vals = (pca.mod$sdev^2)/sum(pca.mod$sdev^2))%>%
+  mutate(comp = seq(1,20),
+         variance.explained = cumsum(vals))
+ggplot(scree.vals, aes(x = comp, y = variance.explained))+
+  geom_line(linetype = 'dashed')+
+  geom_point(color = yaz_cols[1], size = 4)+
+  labs(y = 'Proportion of Variance Explained',
+       x = 'Component',
+       title = 'Fig 6: PCA Scree Plot')+
+  theme_yaz(base_size = 10)+
+  geom_hline(yintercept = .75)
+```
+
+```{r, echo = FALSE}
+pca.df.train <- pca.mod$scores%>%
+  data.frame()%>%
+  bind_cols(data.train.std.y)
+pca.mod.valid <- princomp(data.valid.std.y%>%dplyr::select(-damt), cor = TRUE)$scores%>%
+  data.frame()%>%
+  bind_cols(data.valid.std.y)
+pcr <- lm(damt ~ Comp.1 + Comp.2 + Comp.3 + Comp.4 + Comp.5
+            + Comp.6 + Comp.7 + Comp.8 + Comp.9, 
+                pca.df.train)
+# summary(pcr)
+pcr.preds <- bind_cols(
+  data.valid.std.y%>%dplyr::select(damt), 
+  data.frame(pred = predict(pcr, pca.mod.valid))
+  )%>%
+  mutate(pred.error = damt - pred)
+
+mse[2] <- mean(pcr.preds$pred.error^2)
+st.error[2] <- sd(pcr.preds$pred.error^2)/sqrt(nrow(data.valid.std.y))
+pcr <- ggplot(pcr.preds, aes(x = pred, y = damt))+
+  geom_point(size = 2, alpha = .5, color = yaz_cols[4])+
+  labs(x = 'Predicted Donation Amount',
+       y = 'Actual Amount',
+       title = 'Principal Components Regression')+
+  theme_yaz()+
+  geom_segment(aes(x = 0, xend = 25, y = 0, yend = 25))
+```
+
+## Generalized Additive Model
+The Generalized Additive Model calculates separate functions for all input relationships and adds their contributions together to make predictions. Unlike OLS regression, GAMs allow for both linear and non-linear inputs. Five such models are tested below with several non-linear inputs used to predict donation amount. The winning combination of variables is Model 4.
+```{r, echo = FALSE}
+method[3] <- 'Generalized Additive Model'
+library(gam)
+gam.mod1=gam(damt~s(chld,2)+s(hinc,3)+s(wrat,3)+s(rgif,3)+ tlag,data=data.train.std.y)
+gam.mod2=gam(damt~s(hinc,3)+s(wrat,3)+s(rgif,3)+ tlag,data=data.train.std.y)
+gam.mod3=gam(damt~s(chld,2)+s(hinc,3)+s(wrat,3)+s(rgif,3),data=data.train.std.y)
+gam.mod4=gam(damt~+s(hinc,3)+s(wrat,3)+s(rgif,3),data=data.train.std.y)
+gam.mod5=gam(damt~+hinc+s(wrat,3)+s(rgif,3),data=data.train.std.y)
+
+anova(gam.mod1, gam.mod2, gam.mod3, gam.mod4, gam.mod5, test = 'F')
+# ANOVA results indicate that mod4 is best (excluding s(chld,2) + tlag)
+```
+
+```{r, echo = FALSE}
+pred <- predict(gam.mod4, data.valid.std.y)
+gam.preds <- bind_cols(
+  data.valid.std.y%>%dplyr::select(damt), 
+  data.frame(pred)
+  )%>%
+  mutate(pred.error = damt - pred)
+
+mse[3] <- mean(gam.preds$pred.error^2)
+st.error[3] <- sd(gam.preds$pred.error^2)/sqrt(nrow(data.valid.std.y))
+gam.plot <- ggplot(gam.preds, aes(x = pred, y = damt))+
+  geom_point(size = 2, alpha = .5, color = yaz_cols[4])+
+  labs(x = 'Predicted Donation Amount',
+       y = 'Actual Amount',
+       title = 'Principal Components Regression')+
+  theme_yaz()+
+  geom_segment(aes(x = 0, xend = 25, y = 0, yend = 25))
+```
+
+## Backward Stepwise
+```{r, echo = FALSE}
+library(leaps)
+method[4] <- 'Backward Stepwise'
+model.back <- regsubsets(damt~., data = data.train.std.y, nvmax = ncol(data.train.std.y)-1, method = 'backward')
+
+test.mat=model.matrix(damt???.,data = data.train.std.y)
+val.errors=c()
+for(i in seq(2:ncol(data.train.std.y))){
+  coefi=coef(model.back, id=i)
+  pred=test.mat[,names(coefi)]%*%coefi
+  val.errors[i]=mean((data.train.std.y$damt-pred)^2) 
+}
+```
+
+To select the right number of variables to keep, the MSE of each candidate model produced through backward stepwise selection is plotted against the number of variables in the model. Similar to the interpretation of a scree plot, we see an inflection point at roughly the five variable model.
+
+```{r, echo = FALSE, fig.width=6, fig.height=3}
+data.frame(val.errors)%>%
+  mutate(numvars = seq(1,length(val.errors)))%>%
+  ggplot(aes(x = numvars, y = val.errors))+
+    geom_line(linetype = 'dashed')+
+    geom_point(color = yaz_cols[1], size = 3)+
+    labs(y = 'Model Error',
+         x = 'Number of Predictors',
+         title = 'Fig 7: Number of Predictors by Total Model Error')+
+    theme_yaz(base_size = 10)
+```
+
+```{r, echo = FALSE}
+setpmod <- lm(damt ~ reg3 + reg4 + chld + hinc + incm + rgif + agif, 
+                data.train.std.y)
+# summary(data.train.std.y%>%dplyr::select(home, chld, hinc, incm, plow, npro, rgif, agif))
+bs.preds <- bind_cols(
+  data.valid.std.y%>%dplyr::select(damt), 
+  data.frame(pred = predict(setpmod, data.valid.std.y))
+  )%>%
+  mutate(pred.error = damt - pred)
+
+mse[4] <- mean(mlr.preds$pred.error^2)
+st.error[4] <- sd(mlr.preds$pred.error^2)/sqrt(nrow(data.valid.std.y))
+
+bs <- ggplot(mlr.preds, aes(x = pred, y = damt))+
+  geom_point(size = 2, alpha = .5, color = yaz_cols[4])+
+  labs(x = 'Predicted Donation Amount',
+       y = 'Actual Amount',
+       title = 'Backward Stepwise')+
+  theme_yaz()+
+  geom_segment(aes(x = 0, xend = 25, y = 0, yend = 25))
+```
+
+## Boosted Regression Tree
+Regression trees work similarly to classification trees except that they produce an estimate of a continuous distribution rather than a likelihood of group-membership. Due to the improvement boosting demonstrates in the classification context, a boosted regression tree model is used rather than the more basic version. 5,000 trees are grown at a maximum interaction depth of 4. 
+```{r}
+# method[5] <- 'Regression Tree'
+library(gbm)
+boost.damt <- gbm(damt ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + genf + wrat + 
+                   avhv + incm + inca + plow + npro + tgif + lgif + rgif + tdon + tlag + agif, 
+                 data.train.std.y, distribution = 'gaussian',n.trees=5000, interaction.depth=4)
+
+preds <- predict(boost.damt, data.valid.std.y,n.trees=5000, type = 'response')
+boosted.preds <- data.frame(
+  damt = data.valid.std.y$damt,
+  pred = preds
+  )%>% 
+  mutate(pred.error = damt- pred)
+
+mse[5] <- mean(boosted.preds$pred.error^2)
+st.error[5] <- sd(boosted.preds$pred.error^2)/sqrt(nrow(data.valid.std.y))
+boost.plot <- ggplot(mlr.preds, aes(x = pred, y = damt))+
+  geom_point(size = 2, alpha = .5, color = yaz_cols[4])+
+  labs(x = 'Predicted Donation Amount',
+       y = 'Actual Amount',
+       title = 'Accuracy of Donation Predictions')+
+  theme_yaz()+
+  geom_segment(aes(x = 0, xend = 25, y = 0, yend = 25))
+yhat.test <- predict(boost.damt, data.test.std,n.trees=5000, type = 'response')
+chat.test <- predict(lda.fit, data.test.std, type="response")$class # post probs for test data
+data.frame(chat.test, yhat.test)%>%
+  write.csv('JAY.csv')
+```
+
+## Evaluation of Methods
+The boosted regression tree clearly outperformed all four other methods in terms of average prediction error. Backward stepwise selection had a similar standard error, but missed the prediction amount by about 43 cents more than the regression tree. 
+```{r}
+reg.results <- data.frame(method, mse, st.error)
+knitr::kable(reg.results, digits = 2,
+             col.names = c('Method','Mean Prediction Error','Standard Error'))
+```
+
+```{r}
+y.dfs <- list(mlr.preds%>%mutate(method = 'Ordinary Least Squares'),
+              pcr.preds%>%mutate(method = 'Principal Components Regression'),
+              gam.preds%>%mutate(method = 'Generalized Additive Model'), 
+              bs.preds%>%mutate(method = 'Backwards Stepwise Selection'),
+              boosted.preds%>%mutate(method = 'Boosted Regression Tree'))%>%
+  bind_rows()
+
+ggplot(y.dfs, aes(x = pred, y = damt))+
+  geom_point(size = 2, alpha = .5, color = yaz_cols[4])+
+  labs(x = 'Predicted Donation Amount',
+       y = 'Actual Amount',
+       title = 'Fig 8: Accuracy of Donation Predictions')+
+  theme_yaz(base_size = 10)+
+  geom_segment(aes(x = 0, xend = 25, y = 0, yend = 25))+
+  facet_wrap(~method)
+```
+
+# Tying It All Together
+The client should use the boosted regression tree model to predict donation amount and the linear discriminant model to predict donation likelihood as those models outperformed all other attempted models. By using that combination, the charity can expect to accurately classify donors and non-donors in 83% cases and they can predict donation amounts within $1.54 per donor. 
