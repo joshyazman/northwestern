@@ -1,0 +1,550 @@
+---
+title: "PREDICT 411 - Moneyball Prediction Assignment"
+author: 'Josh Yazman'
+output: html_notebook
+---
+
+# Introduction and Data Overview
+The purpose of this assignment is to predict the number of baseball games a team will win based on a data set of historic performance data and wins. First, missing data is accounted for and, where possible, null values and outliers are imputed using variable-specific regression tree models. Then four linear models are attempted using different variable selection techniques with the purpose of minimizing prediction error. Additionally, a boosted regression tree model is tested following the four linear models to attempt to improve predictive accuracy. Finally, `R` code is provided to score a fresh data file and make predictions for teams not included in the original sample. 
+
+## Exploratory Data Analysis and Prep
+### Missing Data
+The dataset includes information on teams from about 2,200 basball teams between 1871 and 2006. All stats are adjusted for a 162 game season. Two variables (batters hit by pitch and baserunners caught stealing) were removed since they were more than 15% blank. For the remaining variables, null values are imputed using the variable-specific regression trees. One new variable is also added to consolidate all non-home-run hit variables into one variable for total bases on first hit (hit = 1 base, double = 2 bases, etc). 
+
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+setwd('C:/Users/joshy/Google Drive/northwestern/PREDICT-411/general-docs/moneyball/')
+library(tidyverse)
+library(yaztheme)
+library(reshape2)
+library(ggridges)
+library(ggplot2)
+library(randomForest)
+library(moments)
+
+train <- read_csv('moneyball.csv')
+test <- read_csv('moneyball_test.csv')
+
+## Your first step is to turn outliers into null values 
+## Then you want to impute those nulls using a regression tree model with all other variables in the data
+nulls <- data.frame(col = as.character(colnames(train)), 
+                    pct_null = colSums(is.na(train))*100/(colSums(is.na(train))+colSums(!is.na(train))))%>%
+  filter(col != 'INDEX')
+null_count <- ggplot(nulls, aes(x = col, y = pct_null))+
+  geom_bar(fill = yaz_cols[1], stat = 'identity')+
+  coord_flip()+
+  labs(title = 'Figure 0.1: Distribution of Missing Data',
+       x = element_blank(), y = 'Percent of Information Missing')+
+  theme_yaz()+
+  geom_hline(yintercept = 15, linetype = 'dashed')
+
+add_up_bases <- function(df){
+  df$total_bases <- df$TEAM_BATTING_H + (2* df$TEAM_BATTING_2B) + (3* df$TEAM_BATTING_3B) + df$TEAM_BATTING_BB
+  return(df%>%dplyr::select(-TEAM_BATTING_H, -TEAM_BATTING_2B, -TEAM_BATTING_3B, -TEAM_BATTING_BB,
+                            # Remove the values that are more than 15% NULL
+                            -TEAM_BATTING_HBP, -TEAM_BASERUN_CS)#%>%
+  # Replace the remaining numeric nulls with the median value of the column
+  #mutate_if(is.numeric, na.roughfix)
+  )
+}
+train <- add_up_bases(train)
+null_count
+```
+
+### Skewed Distributions and Outliers
+For building an OLS linear model, we need data that is not skewed heavily by outliers or overly clustered in any one area. Figure 1.2 illustrates problemmatic skews in the distribution of errors, strike outs, hits, and walks. To remedy this problem, we first identify outliers (1.5xIQR above or below the first and third quartile), convert those values to nulls, and impute those null values using regression trees. Hits and errors appear to have the most outliers. 
+```{r, echo = FALSE, warning=FALSE, message = FALSE}
+cleaned_cols <- list()
+for(c in colnames(train[c(-1,-2)])){
+  column <- train%>%select_(col = c)
+  iqr <- quantile(column$col, na.rm = T)[4] - quantile(column$col, na.rm = T)[2]
+  low <- quantile(column$col, na.rm = T)[2] - iqr
+  high <- quantile(column$col, na.rm = T)[4] + iqr
+  
+  vals <- c()
+  for(i in seq(1:nrow(train))){
+    ifelse(between(column$col[i], low - (1.5*iqr), high + (1.5*iqr)),
+           vals[i] <- column$col[i], 
+           ifelse(is.na(column$col[i]), vals[i] <- NA, vals[i] <- NA))
+  }
+  
+  ifelse(length(vals) == nrow(train),
+         cleaned_cols[[c]] <- vals, 
+         cleaned_cols[[c]] <- c(vals,NA))
+}
+
+train <- bind_cols(INDEX = train$INDEX, TARGET_WINS = train$TARGET_WINS, cleaned_cols)
+
+library(mice)
+temp_train <- mice(train%>%dplyr::select(-TARGET_WINS, -INDEX), method = 'cart')
+train <- complete(temp_train, 1)%>%
+  bind_cols(train%>%dplyr::select(TARGET_WINS, INDEX))
+```
+
+### Initial Correlations
+One last data exploration step is to determine which variables correlate most strongly with `TARGET_WINS`. No variable alone explains a great deal of the variance in the data, but `total_bases` explains the most, followed by `TEAM_PITCHING_BB` and `TEAM_PITCHING_HR`. 
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+cors <- data.frame(cors = cor(train, method = 'pearson')['TARGET_WINS',]^2, vars = rownames(cor(train)))
+
+ggplot(cors%>%filter(!vars %in% c('TARGET_WINS','INDEX')), 
+                     aes(x = reorder(vars,cors), y = cors))+
+  geom_bar(stat = 'identity', fill = yaz_cols[1])+
+  coord_flip()+
+  theme_yaz()+
+  labs(title = 'Figure 0.2: Correlation of Variables with Wins',
+       x = element_blank(), y = 'Spearman Correlation Coefficient')
+```
+
+## Model Selection
+Four OLS models will be developed for this project using different methods of variable selection: manual, backwards, both-directional stepwise, and principal components regression. Additionally, a boosted regression trees model will be used to predict. The evaluation criteria is root mean squared error (RMSE) calculated on a holdout sample of the training data. 
+
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+method <- c()
+rmse <- c()
+```
+
+### Simple Heuristic OLS Regression
+A simple linear regression model using some of the variables that correlate with win-count in ways that make sense includes total bases earned, fielding errors, and stolen bases. The model only explains 22% of the variance in the training data, but the model does predict an average of 81 wins with root mean squared error (out of sample) of 13 games which seems reasonable. The model residuals are fairly normally distributed with some heteroskedasticity problems at the extremes, but overall this approach is a good start.
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+method[1] <- 'Simple Heuristic'
+train.train <- sample_frac(train, .8)
+train.test <- train%>%filter(!INDEX %in% train.train)#[!is.infinite(rowSums(train)),'INDEX'])
+simple_mod <- lm(TARGET_WINS~total_bases + TEAM_PITCHING_BB + TEAM_PITCHING_HR,# + TEAM_PITCHING_HR,
+                 data = train.train)
+summary(simple_mod)
+preds <- predict(simple_mod, train.test, type = 'response')
+simple_preds <- data.frame(
+  wins = train.test$TARGET_WINS,
+  preds
+  )%>% 
+  mutate(pred.error = wins- preds)
+
+rmse[1] <- sqrt(mean(simple_preds$pred.error^2, na.rm = T))
+
+resid_plot_s <- ggplot(data.frame(resid = simple_mod$residuals,
+                  fitted = simple_mod$fitted.values),
+       aes(x = fitted, y = resid))+
+  geom_point(alpha = .5, color = yaz_cols[3])+
+  theme_yaz()+
+  labs(title = 'Figure 1.1: Model Residuals',
+       subtitle = 'lm(TARGET_WINS~total_bases + TEAM_FIELDING_E + TEAM_BASERUN_SB)',
+       x = 'Fitted Values', y = 'Residuals')+
+  geom_hline(yintercept = 0, linetype = 'dashed', 
+             color = yaz_cols[1], size = 1)+
+  ylim(-75,75)
+resid_hist_s <- ggplot(data.frame(res = simple_mod$residuals),
+                     aes(x = res))+
+  geom_density(fill = yaz_cols[1])+
+  coord_flip()+
+  labs(y = 'Frequency', x = 'Residuals', title = ' ', subtitle = ' ')+
+  theme_yaz()+
+  xlim(-75,75)
+grid.arrange(
+  resid_plot_s, resid_hist_s,
+  widths = c(3,1),
+  nrow = 1
+)
+
+```
+
+
+### Backwards Variable Selection
+Backwards variable selection techniques use Akaike Information Criterion (AIC) to select the model that best explains the variance in the existing data without overfitting the model. The method initially trains a model using all available variables and sequentially removes variables based on their impact on AIC. For each number of variables in a model, the backwards selection model returns the best variables to include in the model. In out of sample testing, marginal improvements to root-mean-squared-error fall diminish after 6 variables are included in the model (Figure 2.1).
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+library(leaps)
+method[2] <- 'Backward Stepwise'
+model.back <- regsubsets(TARGET_WINS~., 
+                         data = train.train,
+                         nvmax = ncol(train.train)-1, 
+                         method = 'backward')
+mod.sum <- summary(model.back)
+
+rmse_temp <- c()
+formulae <- c()
+for(i in seq(1:(nrow(mod.sum$which)))){
+  vars <- c()
+  ifelse(mod.sum$which[i, c('total_bases')] == T,
+         vars[length(vars)+1] <- 'total_bases', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum$which[i, c('TEAM_BATTING_HR')] == T,
+         vars[length(vars)+1] <- 'TEAM_BATTING_HR', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum$which[i, c('TEAM_BATTING_SO')] == T,
+         vars[length(vars)+1] <- 'TEAM_BATTING_SO', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum$which[i, c('TEAM_BASERUN_SB')] == T,
+         vars[length(vars)+1] <- 'TEAM_BASERUN_SB', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum$which[i, c('TEAM_PITCHING_H')] == T,
+         vars[length(vars)+1] <- 'TEAM_PITCHING_H', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum$which[i, c('TEAM_PITCHING_HR')] == T,
+         vars[length(vars)+1] <- 'TEAM_PITCHING_HR',vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum$which[i, c('TEAM_PITCHING_BB')] == T,
+         vars[length(vars)+1] <- 'TEAM_PITCHING_BB', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum$which[i, c('TEAM_PITCHING_SO')] == T,
+         vars[length(vars)+1] <- 'TEAM_PITCHING_SO', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum$which[i, c('TEAM_FIELDING_E')] == T,
+         vars[length(vars)+1] <- 'TEAM_FIELDING_E', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum$which[i, c('TEAM_FIELDING_DP')] == T,
+         vars[length(vars)+1] <- 'TEAM_FIELDING_DP', vars[length(vars)+1] <- ' ')
+  formula <- parse(text = paste0('lm(TARGET_WINS ~ ',paste(vars[vars != ' '], collapse = '+'),
+                                 ', data = train.train[!is.infinite(rowSums(train.train)),])'))
+  formulae[i] <- formula
+  rmse_temp[i] <- sqrt(
+    mean(
+      (train.test$TARGET_WINS - predict(
+        eval(
+          formula
+          ), newdata = train.test[!is.infinite(rowSums(train.test)),]
+        ))^2,na.rm = T)
+    )
+}
+
+ggplot(data.frame(nvars = seq(1:(ncol(train)-1)), rmse_temp),
+       aes(x = nvars, y = rmse_temp))+
+  geom_point(color = yaz_cols[1], size = 1.5)+
+  geom_line(color = yaz_cols[1], linetype = 'dashed')+
+  labs(title = 'Figure 2.1: RMSE By Number of Variables Included',
+       x = 'Number of Variables',
+       y = 'RMSE')+
+  theme_yaz()
+```
+
+Again, the model residuals appear to be normally distributed with a bit more uncertainty on the ends of the distribution of predicted values. The six-variable model predicts an average of 81 wins per team with an RSME value of 13 games.  
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+## The best model by RMSE is the one with 8 variables
+best_ols <- eval(parse(text = formulae[6]))
+
+sum.mod.back <- summary(best_ols)
+back_preds <- data.frame(wins = train.test$TARGET_WINS, 
+                        preds = predict(best_ols, newdata = train.test))%>%
+  mutate(pred.error = wins - preds)
+
+rmse[2] <- sqrt(mean(back_preds$pred.error^2, na.rm = T))
+
+resid_plot <- ggplot(data.frame(fit = best_ols$fitted.values, res = best_ols$residuals),
+       aes(x = fit, y = res))+
+  geom_point(alpha = .5, color = yaz_cols[3])+
+  labs(title = 'Figure 2.2: Model Residuals',
+       subtitle = 'lm(TARGET_WINS~total_bases)',
+       x = 'Fitted Values', y = 'Residuals')+
+  geom_hline(yintercept = 0, linetype = 'dashed', 
+             color = yaz_cols[1], size = 1)+
+  theme_yaz()+
+  ylim(-75,75)
+
+resid_hist <- ggplot(data.frame(res = best_ols$residuals),
+                     aes(x = res))+
+  geom_density(fill = yaz_cols[1])+
+  coord_flip()+
+  labs(y = 'Frequency', x = 'Residuals', title = '\n')+#, subtitle = '\n')+
+  theme_yaz()+
+  xlim(-75,75)
+grid.arrange(
+  resid_plot, resid_hist,
+  widths = c(3,1),
+  nrow = 1
+)
+```
+
+### Bi-Directional Variable Selection
+Bi-direcitonal techniques work similarly to backwards variable selection, but at each iteration of model building, variables can be added or removed. Again, for each number of variables in a model, the algorithm returns the best variables to include. In out of sample testing, marginal improvements to root-mean-squared-error diminish when 6 variables are included in the model (Figure 3.1).
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+method[3] <- 'Bi-Directional Stepwise'
+model.bi <- regsubsets(TARGET_WINS~., 
+                         data = train.train, 
+                         nvmax = ncol(train.train)-1, 
+                         method = 'seqrep')
+mod.sum.bi <- summary(model.bi)
+
+rmse_temp <- c()
+formulae <- c()
+for(i in seq(1:(nrow(mod.sum$which)))){
+  vars <- c()
+  ifelse(mod.sum.bi$which[i, c('total_bases')] == T,
+         vars[length(vars)+1] <- 'total_bases', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum.bi$which[i, c('TEAM_BATTING_HR')] == T,
+         vars[length(vars)+1] <- 'TEAM_BATTING_HR', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum.bi$which[i, c('TEAM_BATTING_SO')] == T,
+         vars[length(vars)+1] <- 'TEAM_BATTING_SO', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum.bi$which[i, c('TEAM_BASERUN_SB')] == T,
+         vars[length(vars)+1] <- 'TEAM_BASERUN_SB', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum.bi$which[i, c('TEAM_PITCHING_H')] == T,
+         vars[length(vars)+1] <- 'TEAM_PITCHING_H', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum.bi$which[i, c('TEAM_PITCHING_HR')] == T,
+         vars[length(vars)+1] <- 'TEAM_PITCHING_HR',vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum.bi$which[i, c('TEAM_PITCHING_BB')] == T,
+         vars[length(vars)+1] <- 'TEAM_PITCHING_BB', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum.bi$which[i, c('TEAM_PITCHING_SO')] == T,
+         vars[length(vars)+1] <- 'TEAM_PITCHING_SO', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum.bi$which[i, c('TEAM_FIELDING_E')] == T,
+         vars[length(vars)+1] <- 'TEAM_FIELDING_E', vars[length(vars)+1] <- ' ')
+  ifelse(mod.sum.bi$which[i, c('TEAM_FIELDING_DP')] == T,
+         vars[length(vars)+1] <- 'TEAM_FIELDING_DP', vars[length(vars)+1] <- ' ')
+  formula <- parse(text = paste0('lm(TARGET_WINS ~ ',paste(vars[vars != ' '], collapse = '+'),
+                                 ', data = train.train[!is.infinite(rowSums(train.train)),])'))
+  formulae[i] <- formula
+  rmse_temp[i] <- sqrt(
+    mean(
+      (train.test$TARGET_WINS - predict(
+        eval(
+          formula
+          ), newdata = train.test[!is.infinite(rowSums(train.test)),]
+        ))^2,na.rm = T)
+    )
+}
+
+ggplot(data.frame(nvars = seq(1:(ncol(train)-1)), rmse_temp),
+       aes(x = nvars, y = rmse_temp))+
+  geom_point(color = yaz_cols[1], size = 1.5)+
+  geom_line(color = yaz_cols[1], linetype = 'dashed')+
+  labs(title = 'Figure 3.1: RMSE By Number of Variables Included',
+       x = 'Number of Variables',
+       y = 'RMSE')+
+  theme_yaz()
+```
+
+Model residuals appear to be normally distributed with a bit more uncertainty on the ends of the distribution of predicted values. The seven-variable model predicts an average of 81 wins per team with an RSME value of 13 games.  
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+## The best model by RMSE is the one with 8 variables
+best_ols.both <- eval(parse(text = formulae[7]))
+
+sum.mod.both <- summary(best_ols.both)
+both_preds <- data.frame(wins = train.test$TARGET_WINS, 
+                        preds = predict(best_ols.both, newdata = train.test))%>%
+  mutate(pred.error = wins - preds)
+
+resid_plot <- ggplot(data.frame(fit = best_ols.both$fitted.values, res = best_ols$residuals),
+       aes(x = fit, y = res))+
+  geom_point(alpha = .5, color = yaz_cols[3])+
+  labs(title = 'Figure 3.2: Model Residuals',
+       subtitle = 'lm(TARGET_WINS~total_bases)',
+       x = 'Fitted Values', y = 'Residuals')+
+  geom_hline(yintercept = 0, linetype = 'dashed', 
+             color = yaz_cols[1], size = 1)+
+  theme_yaz()+
+  ylim(-75,75)
+
+resid_hist <- ggplot(data.frame(res = best_ols$residuals),
+                     aes(x = res))+
+  geom_density(fill = yaz_cols[1])+
+  coord_flip()+
+  labs(y = 'Frequency', x = 'Residuals', title = '\n')+#, subtitle = '\n')+
+  theme_yaz()+
+  xlim(-75,75)
+
+rmse[3] <- sqrt(mean(both_preds$pred.error^2, na.rm = T))
+
+grid.arrange(
+  resid_plot, resid_hist,
+  widths = c(3,1),
+  nrow = 1
+)
+```
+
+## Principal Components Regression
+Principal components regression involves developing a principal components model for dimension reduction purposes and using those components that explain the bulk of the variation in the data as regressors in a linear model. Figure 4.1 illustrates the results of the principal components algorithm which concentrated roughly 80% of the variation in the data in the first three components.  
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+method[4] <- 'Principal Components Regression'
+pca.mod <- princomp(train.train%>%dplyr::select(-INDEX, -TARGET_WINS), cor = TRUE)
+scree.vals <- data.frame(vals = (pca.mod$sdev^2)/sum(pca.mod$sdev^2))%>%
+  mutate(comp = seq(1,length(pca.mod$sdev)),
+         variance.explained = cumsum(vals))
+
+ggplot(scree.vals, aes(x = comp, y = variance.explained))+
+  geom_line(linetype = 'dashed')+
+  geom_point(color = yaz_cols[1], size = 4)+
+  labs(y = 'Proportion of Variance Explained',
+       x = 'Component',
+       title = 'Fig 4.1: PCA Scree Plot')+
+  theme_yaz(base_size = 10)+
+  geom_hline(yintercept = .75)
+```
+
+The principal components regression model explained less variance with greater uncertainty than any of the other models tested (81 wins per team predicted with RMSE of 14). This is unlikely to be the ideal model for predicting outcomes.
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+pca.df.train <- pca.mod$scores%>%
+  data.frame()%>%
+  bind_cols(train.train)
+pca.mod.valid <- princomp(train.test%>%
+                            dplyr::select(-INDEX, -TARGET_WINS)%>%
+                            scale()%>%data.frame())$scores%>%
+  data.frame()%>%
+  bind_cols(train.test)
+pcr <- lm(TARGET_WINS ~ Comp.1 + Comp.2 + Comp.3, 
+                pca.df.train)
+names(pca.mod.valid$scores)
+# summary(pcr)
+pcr_preds <- bind_cols(
+  train.test%>%dplyr::select(wins = TARGET_WINS), 
+  data.frame(preds = predict(pcr, pca.mod.valid))
+  )%>%
+  mutate(pred.error = wins - preds)
+
+rmse[4] <- sqrt(mean(pcr_preds$pred.error^2))
+pcr_plot <- ggplot(pcr_preds, aes(x = preds, y = pred.error))+
+  geom_point(alpha = .5, color = yaz_cols[3])+
+  labs(title = 'Figure 4.2: Model Residuals',
+       subtitle = 'Boosted Regression Tree',
+       x = 'Fitted Values', y = 'Residuals')+
+  geom_hline(yintercept = 0, linetype = 'dashed', 
+             color = yaz_cols[1], size = 1)+
+  theme_yaz()+
+  ylim(-75,75)
+
+pcr_hist <- ggplot(pcr_preds, aes(x = pred.error))+
+  geom_density(fill = yaz_cols[1])+
+  coord_flip()+
+  labs(y = 'Frequency', x = 'Residuals', title = '\n')+#, subtitle = '\n')+
+  theme_yaz()+
+  xlim(-75,75)
+
+grid.arrange(
+  pcr_plot, pcr_hist,
+  widths = c(3,1),
+  nrow = 1
+)
+```
+
+## Model Evaluation
+The primary evaluation criteria for the four predictive models is root mean squared error calculated using a holdout set of 20% of the training data. Figure 5.1 shows scatter plots of predicted values and actual values for each model as well as a reference line demonstrating the pattern of a set of perfect predictions. Figure 5.2 ranks each model according to RMSE.
+
+```{r, fig.width=10, fig.height=6, echo = FALSE, message=FALSE, warning = FALSE}
+all_preds <- bind_rows(
+  simple_preds%>%mutate(method = method[1]),
+  back_preds%>%mutate(method = method[2]),
+  both_preds%>%mutate(method = method[3]),
+  pcr_preds%>%mutate(method = method[4])
+)
+
+oos_valid <- ggplot(all_preds, aes(x = preds, y = wins))+
+  geom_point(size = 1.5, color = yaz_cols[1], alpha = .5)+
+  geom_abline(intercept = 0, slope = 1)+
+  xlim(0,125)+
+  facet_wrap(~method)+
+  labs(title = 'Figure 5.1: Out of Sample Validation of Model Predictions',
+       x = 'Predicted Value', y = 'Actual Wins by Team and Year')+
+  theme_yaz()
+
+rmse_bar <- ggplot(data.frame(method, rmse), aes(x = reorder(method, rmse), y= rmse))+
+  geom_bar(stat = 'identity', fill = yaz_cols[1])+
+  labs(y = 'RMSE', x = element_blank(),
+       title = '5.2: RMSE by Method')+
+  theme_yaz()+
+  theme(axis.text.x = element_text(angle = 90))
+
+grid.arrange(oos_valid, rmse_bar, nrow = 1, widths = c(3,1))  
+```
+
+All of the models generally follow similar patterns in Figure 5.1. Principal components regression follows the line of perfect fit more loosely than the rest while the two stepwise models have more attractive distributions. . Please find the `R` code for applying the model to fresh data in Appendix A.
+
+# Appendices
+## Appendix A: Boosted Regression Tree
+Regression trees are built by repeatedly partitioning the data according to regression models that minimize sum of squared error terms and averaging the results of the partitioned values. Like the other models, the regression tree predictions average 81 wins, but the root mean squared error is lower at 11 games. Residuals from the resulting model are normally distributed averaging zero, so this model is a promising step towards finding a good model for win likelihood.
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+method[5] <- 'Regression Tree'
+
+library(gbm)
+boost.wins <- gbm(TARGET_WINS ~ ., train.train%>%dplyr::select(-INDEX), 
+                  distribution = 'gaussian', n.trees=5000, interaction.depth=6)
+
+preds <- predict(boost.wins, train.test, n.trees=5000, type = 'response')
+tree_preds <- data.frame(
+  wins = train.test$TARGET_WINS,
+  preds
+  )%>% 
+  mutate(pred.error = wins- preds)
+
+rmse[5] <- sqrt(mean(tree_preds$pred.error^2, na.rm = T))
+
+boost_plot <- ggplot(tree_preds, aes(x = preds, y = pred.error))+
+  geom_point(alpha = .5, color = yaz_cols[3])+
+  labs(title = 'Figure 3.2: Model Residuals',
+       subtitle = 'Boosted Regression Tree',
+       x = 'Fitted Values', y = 'Residuals')+
+  geom_hline(yintercept = 0, linetype = 'dashed', 
+             color = yaz_cols[1], size = 1)+
+  theme_yaz()+
+  ylim(-75,75)
+
+boost_hist <- ggplot(tree_preds, aes(x = pred.error))+
+  geom_density(fill = yaz_cols[1])+
+  coord_flip()+
+  labs(y = 'Frequency', x = 'Residuals', title = '\n')+#, subtitle = '\n')+
+  theme_yaz()
+grid.arrange(
+  boost_plot, boost_hist,
+  widths = c(3,1),
+  nrow = 1
+)
+```
+
+How does the boosted regression tree stack up against the other four models? The pattern in Figure 6.1 is similar to that of the simple heuristic model. However, the boosted regression trees demonstrates a significant improvement in RMSE of almost two full games.   
+
+```{r, fig.width=10, fig.height=6, echo = FALSE, message=FALSE, warning = FALSE}
+all_preds <- bind_rows(
+  simple_preds%>%mutate(method = method[1]),
+  back_preds%>%mutate(method = method[2]),
+  both_preds%>%mutate(method = method[3]),
+  pcr_preds%>%mutate(method = method[4]),
+  tree_preds%>%mutate(method = method[5])
+)
+mean(tree_preds$preds)
+mean(tree_preds$wins)
+oos_valid <- ggplot(all_preds, aes(x = preds, y = wins))+
+  geom_point(size = 1.5, color = yaz_cols[1], alpha = .5)+
+  geom_abline(intercept = 0, slope = 1)+
+  xlim(0,125)+
+  facet_wrap(~method)+
+  labs(title = 'Figure 6.1: Out of Sample Validation of Model Predictions',
+       x = 'Predicted Value', y = 'Actual Wins by Team and Year')+
+  theme_yaz()
+
+rmse_bar <- ggplot(data.frame(method, rmse), aes(x = reorder(method, rmse), y= rmse))+
+  geom_bar(stat = 'identity', fill = yaz_cols[1])+
+  labs(y = 'RMSE', x = element_blank(),
+       title = '6.2: RMSE by Method')+
+  theme_yaz()+
+  theme(axis.text.x = element_text(angle = 90))
+
+grid.arrange(oos_valid, rmse_bar, nrow = 1, widths = c(3,1))
+```
+
+## Appendix b: Applying the Model Out of Sample
+The code below applies the transformations and model algorithms to implement the boosted regression tree model. 
+```{r}
+library(mice)
+
+apply_scores <- function(df){
+  
+  temp_data <- add_up_bases(df)
+  
+  cleaned_cols <- list()
+  for(c in colnames(temp_data[c(-1)])){
+    column <- train%>%select_(col = c)
+    iqr <- quantile(column$col, na.rm = T)[4] - quantile(column$col, na.rm = T)[2]
+    low <- quantile(column$col, na.rm = T)[2] - iqr
+    high <- quantile(column$col, na.rm = T)[4] + iqr
+    
+    vals <- c()
+    for(i in seq(1:nrow(temp_data))){
+      ifelse(between(column$col[i], low - (1.5*iqr), high + (1.5*iqr)),
+             vals[i] <- column$col[i], 
+             ifelse(is.na(column$col[i]), vals[i] <- NA, vals[i] <- NA))
+    }
+    
+    ifelse(length(vals) == nrow(temp_data),
+           cleaned_cols[[c]] <- vals, 
+           cleaned_cols[[c]] <- c(vals,NA))
+  }
+
+  temp_data2 <- bind_cols(INDEX = temp_data$INDEX, TARGET_WINS = temp_data$TARGET_WINS, cleaned_cols)
+  
+  temp_data3 <- mice(temp_data2, method = 'cart')
+  temp_data4 <- complete(temp_data3, 1)
+  preds <- bind_cols(
+    temp_data4, data.frame(P_TARGET_WINS = predict(boost.wins, temp_data4, n.trees=5000, type = 'response'))
+    )%>%
+    dplyr::select(INDEX, P_TARGET_WINS)
+  return(preds)
+}
+
+final_preds <- apply_scores(test)  
+
+write.csv(x = final_preds,  file = 'yazman_moneyball_test.csv')
+```
