@@ -1,0 +1,342 @@
+---
+title: "Zillow's Home Value Prediction (Zestimate)"
+subtitle: "Predicting error to improve the Zestimate"
+author: 'Josh Yazman'
+output: html_notebook
+---
+
+# Introduction
+The purpose of this project is to predict the log error of Zillow's Zestimate at six potential sale times in 2016 and 2017 using time series forecasting models. Zillow made all 2016 home sales data from three counties available on [Kaggle](https://www.kaggle.com/c/zillow-prize-1) including all fields in Table 1. Predicting error rates over time will help Zillow to improve their model over time and give consumers better information as they buy and sell the largest assets they'll likely ever own.
+
+R code for all calculations and visuals can be found [here]()
+
+```{r, echo=FALSE, warning=FALSE}
+setwd('C:/Users/joshy/Google Drive/northwestern/PREDICT-413/general-docs/zillow')
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(forecast)
+library(yaztheme)
+library(readxl)
+library(knitr)
+
+
+all_2016 <- read_csv('properties_2016.csv')
+data_dict <- read_excel("zillow_data_dictionary.xlsx")
+train_2016 <- read_csv('train_2016_v2.csv')
+kable(data_dict%>%select(`Column Name` = Feature, Description),
+      caption = 'Table 1: Listing of Available Data')
+```
+
+## Exploratory Data Analysis
+As a first exploratory step, the number of null values for each variable are distplayed in Figure 0.1. Many of the variables in the data set have significant numbers of missing values. This could be due to lack of self-reporting or differing standards for reporting from various government data sources employed by Zillow. A decision rule of 75% completion is used for retention of a variable. Missing values in the remaining columns are imputed using boosted regression and classification trees. 
+```{r, fig.height = 7, echo=FALSE, warning=FALSE}
+library(reshape2)
+full_train <- left_join(train_2016, all_2016)
+
+nulls <- data.frame(col = as.character(colnames(full_train)), 
+                    pct_null = colSums(is.na(full_train))*100/(colSums(is.na(full_train))+colSums(!is.na(full_train))))%>%
+  filter(col != 'parcelid')
+null_count <- ggplot(nulls, aes(x = reorder(col,pct_null), y = pct_null, 
+                                fill = ifelse(pct_null > 25, 'Remove','Retain')))+
+  geom_bar(stat = 'identity')+
+  coord_flip()+
+  labs(title = 'Figure 0.1: Distribution of Missing Data',
+       x = element_blank(), y = 'Percent of Information Missing',
+       subtitle = 'Prior to missing variable imputation or dimension elimination')+
+  yaztheme::theme_yaz()+theme(legend.position = 'right')+
+  geom_hline(yintercept = 25, linetype = 'dashed')+
+  scale_fill_manual(values = yaz_cols[c(4,5)], name = 'Action')
+
+train <- full_train[,colnames(full_train) %in% nulls$col[nulls$pct_null < 25]]
+
+# Holding out these variables so as not to use them in the imputation process!
+hold <- train%>%select(logerror, transactiondate)
+impute <- train%>%select(-logerror, - transactiondate, -censustractandblock,-regionidzip, 
+                         -propertycountylandusecode, -regionidcounty, -propertylandusetypeid, 
+                         -fips, -longitude, -latitude, -regionidcity,-rawcensustractandblock, 
+                         -regionidcounty, -bathroomcnt, -fullbathcnt,-assessmentyear)
+
+null_count
+```
+
+From here I create dummy variables for all categorical values and then summarise all variables so we have average daily values rather than multiple values per day. Some variables (like city id) are removed in this step because we have more granular data (like zip codes) that measure the same thing. 
+```{r, echo=FALSE, warning=FALSE}
+library(mice)
+temp_train <- mice(impute, method = 'cart',maxit = 1)
+train <- complete(temp_train, 1)%>%
+  bind_cols(hold)
+
+library(lubridate)
+
+train.clean <- train%>%
+  mutate(home_age = year(Sys.Date())-yearbuilt)%>%
+  group_by(transactiondate)%>%
+  summarise_all(funs(mean))
+
+zillow.ts <- ts(train.clean, frequency = 365, start=c(2016,1,1))
+z <- zillow.ts[,'logerror']
+library(gridExtra)
+grid.arrange(
+  autoplot(z)+
+    yaztheme::theme_yaz()+
+    labs(x = 'Days', y = 'LogError',
+         title = 'Log Error of Zillow\'s Zestimate Over Time'),
+  ggplot(train.clean, aes(x = logerror))+
+    geom_density(fill = yaz_cols[1], alpha = .75)+
+    labs(title = 'Distribution',
+         x = 'Daily Average LogError',
+         y = 'Density')+
+    yaztheme::theme_yaz()+
+    coord_flip(),
+  nrow = 1, widths = c(3,1)
+)
+```
+
+The logerror rates almost represent a perfect white noise time series over the course of 2016. 
+```{r, echo=FALSE, warning=FALSE}
+ggAcf(z)+
+  yaztheme::theme_yaz()+
+  labs(title = 'ACF Plot of AverageLog Error by Day')
+```
+
+# Model Development and Testing
+Three models are attempted for this project. The first model is a multiple linear regression model using variables selected with a backwards variable selection method. The second model is a simple exponential smoothing model. The final model uses the ARIMA method. Models are evaluated by MAE, ME, and RMSE as well as the average error in the six out of sample test points tests as part of Zillow's Kaggle competition. 
+
+```{r, echo=FALSE, warning=FALSE}
+method = c()
+accuracy = list()
+```
+
+## Multiple Linear Regression Model
+A multiple linear regression model uses linear relationships between predictors and a target value to predict future unseen values. The model takes the form $y_t=\beta_0 + \beta_1 x_{1,t}+ \beta_2 x_{2,t}+ \beta_3 x_{3,t}+ \beta_i x_{i,t}+\varepsilon_t.$ for `i` predictor variables.
+
+The backwards variable selection method employed here starts with all possible predictors in the data set and whittles them away iteratively after testing to see whether or not the inclusion of a variable minimizes the Akaike Information Criterion (AIC). The algorithm's output is the best possible model for each potential number of predictor variables to be included as well as various model health metrics for each potential model. Figure X plots the first 60 or so potential models against residual sum of squares (RSS) and adjusted r-squared (Adj. R-squared), with each variable indexed against it's maximum value vor purposes of comparing them on the same plot [^2]. The 3-variable model is the best possible linear combination of predictor variables according to this method since that value maximizes Adj. R-squared and is near the point of diminishing marginal returns for RSS.
+
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+library(leaps)
+
+model.back <- regsubsets(logerror~., 
+                         data = train.clean%>%dplyr::select(-transactiondate),
+                         nvmax = 100, 
+                         method = 'backward')
+mod.sum <- summary(model.back)
+mod.sum.health <- data.frame(rss = mod.sum$rss,
+                             adjr2 = mod.sum$adjr2,
+                             n_vars = seq(1,length(mod.sum$adjr2)))
+ggplot(mod.sum.health%>%
+         mutate(rss = rss/max(mod.sum.health$rss),
+                adjr2 = adjr2/max(mod.sum.health$adjr2))%>%
+         reshape2::melt(id.vars = 'n_vars'), aes(x = n_vars, y = value, color = variable))+
+  geom_line(size = 1.5)+
+  yaztheme::theme_yaz()+
+  labs(title = 'Model Health by Number of Linear Predictors Included',
+       subtitle = 'RSS and Adj. R-squared Indexed Against Themselves',
+       y = element_blank(),
+       x = 'Number of Variables Included in an MLR Model')+
+  scale_color_manual(values = yaz_cols[c(3,4)], name = 'Model Health Metric',
+                     labels = c('RSS','Adj. R-squared'))
+```
+
+In implementing the model chosen through backwards variable selection, we see fitted values that are more conservative than the actual LogError values observed in the data. The model only explains 22% of the variance in the data and several predictor variables with correlation coefficients indistinguishable frmo zero, although for predictive purposes that is less important than optimizing AIC or out of sample error rates [^3].
+
+```{r, fig.width=10.5,fig.height=4, echo=FALSE, warning=FALSE}
+# maxadjr2 <- which.max(mod.sum$adjr2)
+# vars <- names(mod.sum$which[maxadjr2,][mod.sum$which[maxadjr2,] == T])[-1]
+# formula <- paste0('lm(logerror ~ ',paste(vars, collapse = '+'),', data = train.clean')
+lm.fit <- tslm(logerror ~ calculatedfinishedsquarefeet+structuretaxvaluedollarcnt+
+                 taxvaluedollarcnt, data = zillow.ts)
+summary(lm.fit)
+method[1] = 'Multiple Linear Regression'
+accuracy[[1]] = data.frame(accuracy(lm.fit))
+```
+
+Where the model residuals depart from the normal distribution most notably is a heavy negative tail. In general, the linear model is more conservative than the data - hewing closer to the overall average value than. 
+```{r, fig.width=10.5,fig.height=4, echo=FALSE, warning=FALSE}
+grid.arrange(
+  autoplot(z, series="Actual") +
+    forecast::autolayer(fitted(lm.fit), series="Predicted")+
+    yaztheme::theme_yaz()+
+    theme(legend.position = 'right',
+          legend.direction = "vertical")+
+    scale_color_manual(name = 'Series', values = yaz_cols[c(3,4)])+
+    labs(title = 'Predicted vs. Actual Average LogError Values',
+         y = 'LogError', x = 'Time'),
+  ggplot(data.frame(predicted = lm.fit$fitted.values, actual = lm.fit$residuals+lm.fit$fitted.values),
+         aes(x = predicted, y = actual))+
+    geom_point(size = 1.5, color = yaz_cols[1], alpha = .7)+
+    geom_abline(slope = 1, intercept = 0)+
+    yaztheme::theme_yaz()+
+    labs(title = ' ',
+         y = 'Actual LogError',
+         x = 'MLR Model')+
+    xlim(min(z),max(z))+
+    ylim(min(z),max(z)),
+  ggplot(data.frame(residuals = lm.fit$residuals), aes(x = residuals))+
+    geom_density(fill = yaz_cols[1], alpha = .7)+
+    yaztheme::theme_yaz()+
+    labs(y = 'Density', x = 'Residual LogError',
+         title = 'Residuals\nDistribution')+
+    coord_flip(),
+  nrow = 1,
+  widths = c(3,2,2)
+)
+
+forecast(lm.fit$model, h = 10)
+```
+
+## Simple Exponential Smoothing
+Exponential smoothing methods produce weighted averages of past values controlled by a smoothing parameter $\alpha$ in order to optimize the level $\ell_t$. A smaller value for $\alpha$ means more weight is applied to older observations while a larger value applies more weight to more recent values[^3]. 
+
+The optimal simple exponential smoothing function for the zillow data uses $\ell_{t} = .0133 y_{t} + (1 -.0133)\ell_{t-1}$ and an initial $\ell$ value of .0101. 
+
+```{r, fig.width=10.5,fig.height=4, echo=FALSE, warning=FALSE}
+ses.fit <- ses(z)
+
+# summary(ses.fit)
+method[2] = 'Simple Exponential Smoothing'
+accuracy[[2]] = data.frame(accuracy(ses.fit))
+grid.arrange(
+  autoplot(z, series = "Actual LogError")+
+    autolayer(ses.fit$fitted, series = "SES Model")+
+    theme_yaz()+
+    scale_color_manual(name = 'Series', values = yaz_cols[c(3,4)])+
+    labs(title = 'Predicted vs. Actual Average LogError Values',
+         y = 'LogError', x = 'Time')+
+    theme(legend.position = 'right',
+          legend.direction = "vertical"),
+  ggplot(data.frame(predicted = ses.fit$fitted, actual = ses.fit$residuals+ses.fit$fitted),
+         aes(x = predicted, y = actual))+
+    geom_point(size = 1.5, color = yaz_cols[1], alpha = .7)+
+    geom_abline(slope = 1, intercept = 0)+
+    yaztheme::theme_yaz()+
+    labs(title = ' ',
+         y = 'Actual LogError',
+         x = 'SES Model')+
+    xlim(min(z),max(z))+
+    ylim(min(z),max(z)),
+  ggplot(data.frame(residuals = ses.fit$residuals), aes(x = residuals))+
+    geom_density(fill = yaz_cols[1], alpha = .7)+
+    yaztheme::theme_yaz()+
+    labs(y = 'Density', x = 'Residual LogError',
+         title = 'Residuals\nDistribution')+
+    coord_flip(),
+  nrow = 1,
+  widths = c(3,2,2)
+)
+```
+
+The smoothed predicted values are mostly clustered alightly above zero (around .01). The residuals are not exactly normally distributed because they cluster too closely around 0. Additionally, there are a few outlying values (moreso than the MLR model).
+
+## ARIMA Model
+The AutoRegressive Integrated Moving Average (ARIMA) model is a regression model acounting for lagged error terms and lagged predicted values of the outcome of interest. The model is presented in the form `ARIMA(p,d,q)` where `p` represents the autoregressive formula, `d` indicates the amount of differencing applied to the time series, and `q` describes the moving average component[^3]. 
+
+The `auto.arima()` R function, which uses a step-wise variation of the Hyndman-Khandakar model selection method [^4] to optimize for AIC~c~, returned a first-order autoregressive model as the optimal model for the data. Essentially, the method uses a single period lag as a regressor to make predictions about future outcomes.  
+```{r, fig.width=10.5,fig.height=4, echo=FALSE, warning=FALSE}
+arima.fit <- auto.arima(z,xreg = zillow.ts[,c('calculatedfinishedsquarefeet', 
+                                              'structuretaxvaluedollarcnt','taxvaluedollarcnt')],
+                        seasonal = F, stationary = T)
+# summary(arima.fit)
+method[3] = 'ARIMA'
+accuracy[[3]] = data.frame(accuracy(arima.fit))
+grid.arrange(
+  autoplot(z, series = "Actual LogError")+
+    autolayer(arima.fit$fitted, series = "ARIMA Model")+
+    theme_yaz()+
+    scale_color_manual(name = 'Series', values = yaz_cols[c(3,4)])+
+    labs(title = 'Predicted vs. Actual Average LogError Values',
+         y = 'LogError', x = 'Time')+
+    theme(legend.position = 'right',
+          legend.direction = "vertical"),
+  ggplot(data.frame(predicted = arima.fit$fitted, actual = arima.fit$residuals+arima.fit$fitted),
+         aes(x = predicted, y = actual))+
+    geom_point(size = 1.5, color = yaz_cols[1], alpha = .7)+
+    geom_abline(slope = 1, intercept = 0)+
+    yaztheme::theme_yaz()+
+    labs(title = ' ',
+         y = 'Actual LogError',
+         x = 'ARIMA Model')+
+    xlim(min(z),max(z))+
+    ylim(min(z),max(z)),
+  ggplot(data.frame(residuals = arima.fit$residuals), aes(x = residuals))+
+    geom_density(fill = yaz_cols[1], alpha = .7)+
+    yaztheme::theme_yaz()+
+    labs(y = 'Density', x = 'Residual LogError',
+         title = 'Residuals\nDistribution')+
+    coord_flip(),
+  nrow = 1,
+  widths = c(3,2,2)
+)
+```
+
+The fitted values of the ARIMA model follow a similar pattern to the linear model. Fitted values follow a similar, if more conservative, pattern as the observed values and, while there are some outlying residuals, the bulk of the values are clustered around zero. 
+
+# Model Evaluation
+As stated earlier, models are evaluated by MAE, ME, and RMSE as well as the average error in the six out of sample test points tests as part of Zillow's Kaggle competition.
+
+The average error among all models was fairly small. Differences in RMSE and MAE were also fairly small. Simple Exponential Smoothing performed best on MAE which makes sense because the pattern of the fitted values makes it difficult to imagine that model overfitting the data. ARIMA and MLR perform similarly across the board. 
+```{r, fig.width=9, fig.height=2.5, echo=FALSE, warning=FALSE}
+mod.health <- bind_rows(accuracy)%>%
+  bind_cols(data.frame(method))%>%
+  dplyr::select(ME, RMSE, MAE, method)
+
+ggplot(mod.health%>%
+         melt(id.vars = 'method'), aes(x = method, y = value))+
+  geom_bar(stat = 'identity', fill = yaz_cols[1])+
+  facet_wrap(~variable)+
+  coord_flip()+
+  theme_yaz()+
+  labs(title = 'Model Evaluations', y = element_blank(),
+       x = element_blank())
+```
+
+Finally, the big test is how well the predictions compared to actual values on six prescribed months that Zillow is interested in checking: October 2016 (201610), November 2016 (201611), December 2016 (201612), October 2017 (201710), November 2017 (201711), and December 2017 (201712). The predicted values for the first day of each 2016 month are below: 
+
+```{r, echo=FALSE, warning=FALSE}
+all_2017 <- read_csv('properties_2017.csv')
+test_2017 <- read_csv('train_2017.csv')
+full_test <- left_join(test_2017, all_2017)
+
+
+
+test <- full_test%>%select(transactiondate, bedroomcnt, calculatedbathnbr, calculatedfinishedsquarefeet,
+                             finishedsquarefeet12, lotsizesquarefeet, roomcnt, yearbuilt, 
+                             structuretaxvaluedollarcnt, taxvaluedollarcnt, landtaxvaluedollarcnt,
+                             taxamount, logerror)
+# Holding out these variables so as not to use them in the imputation process!
+hold <- test%>%select(logerror, transactiondate)
+impute <- test%>%select(-logerror, - transactiondate)
+
+library(mice)
+temp_test <- mice(impute, method = 'cart',maxit = 1)
+test <- complete(temp_train, 1)%>%
+  bind_cols(hold)
+
+library(lubridate)
+
+test.clean <- test%>%
+  mutate(home_age = year(Sys.Date())-yearbuilt)%>%
+  group_by(transactiondate)%>%
+  summarise_all(funs(mean))
+
+test.zillow.ts <- ts(test.clean, frequency = 365, start=c(2017,1,1))
+test.full <- ts(bind_rows(train.clean, test.clean)%>%
+                  filter(transactiondate %in% c(as.Date('2016-10-01'),as.Date('2016-11-01'),as.Date('2016-12-01'),
+                                                as.Date('2017-10-01'),as.Date('2017-11-01'),as.Date('2017-12-01'))), 
+                frequency = 365, start = c(2016,1,1))
+forecast(arima.fit, xreg = test.full[,c('calculatedfinishedsquarefeet', 
+                                              'structuretaxvaluedollarcnt','taxvaluedollarcnt')])%>%
+  autoplot()+
+  theme_yaz()+
+  labs(y = 'LogError')+
+  xlim(2016.85,2017)
+```
+
+# Conclusion
+The goal of this project was to predict Zillow Zestimate LogError values. Three models were trained and tested for their predictive accuracy - multiple linear regression, simple exponential smoothing, and ARIMA. The ARIMA and multiple regression models appeared to perform best and teh ARIMA model was used to make predictions about out of sample data points.
+
+# Citations
+[^1:] Time Series Analysis and Its Application with R examples
+[^2:] James, G., Witten, D., Hastie, T., & Tibshirani, R. (2017). An Introduction to Statistical Learning: with Applications in R. New York: Springer.
+[^3:] Hyndman (http://otexts.org/fpp2/Regr-LSprinciple.html)
+[^4:] Hyndman, Rob J, and Yeasmin Khandakar. 2008. "Automatic Time Series Forecasting: The Forecast Package for R." Journal of Statistical Software 27 (1): 1-22.
