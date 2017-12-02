@@ -1,0 +1,390 @@
+---
+title: "Predict 413 Final: Wine Sales Predictions"
+author: 'Josh Yazman'
+output: html_notebook
+---
+
+# Introduction
+The goal of this project is to predict the number of cases of wine sold based on chemical characteristics of close to 13,000 wines. This report will cover the following processes:
+* Cleaning, standardizing, and exploring the data
+* Development of each of the following models
+  * Poisson Regression
+  * Zero-Inflated Poisson Regression
+  * Negative Binomial Regression
+  * Zero-Inflated Negative Binomial Regression
+  * Multiple Linear Regression 
+* Comparison of each model
+* Code to deploy the model on the test data set
+All code and data for this paper can be found [here](https://github.com/joshyazman/northwestern/tree/master/predict-411/wine).
+# Cleaning and Exploring the Data
+The exploration and cleaning step involves creating flag variables for missing values and outliers, deleting the outliers, and use regression trees to impute the remaining values. 
+
+```{r}
+library(readr)
+train_raw <- read_csv('Wine_Training.csv')
+```
+
+The `STARS` field has the most missing data while several chemical measurements are missing 5-10% of values. In case the absence of data is an important factor in sales, a binary flag variable is produced to identify places where data was initially missing from each variable.
+
+```{r}
+library(dplyr)
+nulls <- data.frame(col = as.character(colnames(train_raw)), 
+                    pct_null = colSums(is.na(train_raw))*100/(colSums(is.na(train_raw))+colSums(!is.na(train_raw))))%>%
+  filter(col != 'INDEX')
+ggplot(nulls, aes(x = col, y = pct_null))+
+  geom_bar(fill = yaz_cols[1], stat = 'identity')+
+  coord_flip()+
+  labs(title = 'Distribution of Missing Data',
+       x = element_blank(), y = 'Percent of Information Missing')+
+  theme_yaz()+
+  ylim(0,100)
+```
+
+Outliers, defined as $Q1 - (1.5*IQR)$ and $Q3 + (1.5*IQR)$ are removed from the data set and flag variables are appended in a similar fashion to the missing data flags. Finally, all missing and deleted variables are reimputed using regression trees.
+
+```{r}
+colnames(train_raw) <- tolower(colnames(train_raw))
+
+train.flagged <- train_raw%>%
+  mutate_all(funs(na.flag = ifelse(is.na(.),1,0)))
+int_df <- train.flagged%>%
+  dplyr::select(-index, -target, -index_na.flag, -target_na.flag)%>%
+  dplyr::select_if(is.numeric)
+# md.pattern(int_df)
+cleaned_cols <- list()
+for(c in colnames(train_raw%>%
+                  dplyr::select(-index, -target)%>%
+                  dplyr::select_if(is.numeric))){
+  column <- train.flagged%>%select_(col = c)
+  iqr <- quantile(column$col, na.rm = T)[4] - quantile(column$col, na.rm = T)[2]
+  low <- quantile(column$col, na.rm = T)[2] - iqr
+  high <- quantile(column$col, na.rm = T)[4] + iqr
+  
+  vals <- c()
+  for(i in seq(1:nrow(int_df))){
+    ifelse(between(column$col[i], low - (1.5*iqr), high + (1.5*iqr)),
+           vals[i] <- column$col[i], 
+           ifelse(is.na(column$col[i]), vals[i] <- NA, vals[i] <- NA))
+  }
+  
+  ifelse(length(vals) == nrow(int_df),
+         cleaned_cols[[c]] <- vals, 
+         cleaned_cols[[c]] <- c(vals,NA))
+}
+
+df2 <- bind_cols(
+  bind_cols(cleaned_cols)%>%
+    scale(center = TRUE)%>%
+    data.frame(),
+  train.flagged%>%
+    dplyr::select(ends_with('na.flag'))%>%
+    dplyr::select(-index_na.flag, -target_na.flag)
+)
+
+df3 <- df2%>%
+  mutate(
+    fixedacidity_out.flag = ifelse(is.na(fixedacidity) & fixedacidity_na.flag ==0,1,0),
+    volatileacidity_out.flag = ifelse(is.na(volatileacidity) & volatileacidity_na.flag ==0,1,0),
+    citricacid_out.flag = ifelse(is.na(citricacid) & citricacid_na.flag ==0,1,0),
+    residualsugar_out.flag = ifelse(is.na(residualsugar) & residualsugar_na.flag ==0,1,0),
+    chlorides_out.flag = ifelse(is.na(chlorides) & chlorides_na.flag ==0,1,0),
+    freesulfurdioxide_out.flag = ifelse(is.na(freesulfurdioxide) & freesulfurdioxide_na.flag ==0,1,0),
+    totalsulfurdioxide_out.flag = ifelse(is.na(totalsulfurdioxide) & totalsulfurdioxide_na.flag ==0,1,0),
+    density_out.flag = ifelse(is.na(density) & density_na.flag ==0,1,0),
+    ph_out.flag = ifelse(is.na(ph) & ph_na.flag ==0,1,0),
+    sulphates_out.flag = ifelse(is.na(sulphates) & sulphates_na.flag ==0,1,0),
+    alcohol_out.flag = ifelse(is.na(alcohol) & alcohol_na.flag ==0,1,0),
+    labelappeal_out.flag = ifelse(is.na(labelappeal) & labelappeal_na.flag ==0,1,0),
+    acidindex_out.flag = ifelse(is.na(acidindex) & acidindex_na.flag ==0,1,0),
+    stars_out.flag = ifelse(is.na(stars) & stars_na.flag ==0,1,0)
+)
+
+library(mice)
+temp_df <- mice(df3, method = 'cart', maxit = 1)
+train <- complete(temp_df)%>%
+  bind_cols(train_raw%>%dplyr::select(index, target))%>%
+  dplyr::select(-stars_out.flag, -labelappeal_out.flag, -density_na.flag,
+                -labelappeal_na.flag, -acidindex_na.flag, -fixedacidity_na.flag,
+                -volatileacidity_na.flag, -citricacid_na.flag)
+```
+
+Finally, we can examine  the distributions of our variables. Flags with homogenous values are removed from the training set to get a jump start on stepwise dimension reduction used in the model development stage. 
+
+```{r}
+summary(train)
+```
+
+# Model Development
+Five models are developed for this paper. First is a Poisson regression model followed by a negative binomial regression model. Then zero-inflated versions of each model are developed as well as a multivariate linear regression model. Root mean squared error (RMSE), and mean absolute error (MAE) are calculated for each model for purposes of out of sample model evaluation. 
+
+## Poisson and Negative Binomial Regression
+Poisson regression models use the log link function to approximate regression processes for a count variable distributed such that the variance is equal to the mean [^1]. The backward stepwise feature selection algoritm returned a poisson model with twelve predictors[^2]. Noteably, missing values for `stars` and outlier `acidindex` values significantly harm sales while `labelappeal` and present higher values for `stars` led to higher sales. Negative binomial models use a different probability density function than Poisson regression to account for over-dispersion of the target variable (as we have in this case)[^3]. The coefficients for this model are identical to that of a Poisson model.
+
+```{r}
+library(MASS)
+
+base_poiss <- glm(target ~ ., family="poisson", data=train)
+poiss.back <- stepAIC(base_poiss, direction = 'backward')
+# summary(poiss.back)$call
+poiss.mod <- glm(formula = target ~ volatileacidity + totalsulfurdioxide + 
+    density + ph + sulphates + alcohol + labelappeal + acidindex + 
+    stars + stars_na.flag + volatileacidity_out.flag + acidindex_out.flag, 
+    family = "poisson", data = train)
+
+poiss.coeffs <- data.frame(var = names(poiss.mod$coefficients),
+                           coefficient = poiss.mod$coefficients)%>%
+  mutate(method = 'Poisson')
+
+negbin.mod <- glm.nb(formula = target ~ volatileacidity + totalsulfurdioxide + 
+    density + ph + sulphates + alcohol + labelappeal + acidindex + 
+    stars + stars_na.flag + volatileacidity_out.flag + acidindex_out.flag, 
+    data = train)
+
+negbin.coeffs <- data.frame(var = names(negbin.mod$coefficients),
+                            coefficient = negbin.mod$coefficients)%>%
+  mutate(method = 'Negative Binomial')
+
+
+library(ggplot2)
+library(yaztheme)
+
+ggplot(bind_rows(negbin.coeffs, poiss.coeffs),
+       aes(x = reorder(var, coefficient), y = coefficient, fill = method))+
+  geom_col(position = 'dodge')+
+  coord_flip()+
+  labs(y = 'Coefficient',
+       x = element_blank(),
+       title = 'Regression Coefficients',
+       subtitle = 'Features selected via backwards variable selection')+
+  scale_fill_manual(name = 'Method', values = yaz_cols[4:5])+
+  theme_yaz()
+```
+
+## Zero-Inflated Regression
+Poisson and negative binomial models can be skewed by an overabundance of zero values. Zero-inflated models assumethe distribution has two types of values - rightful zero measurements and a separate set of values that follows a more typical distribution. These models first sort values into their proper category, then predict their outcomes using separate sets of coefficients for each[^4]. In this case, over 2,500 wines sold zero cases so zero-inflated models may improve predictive power. The same variables are used in the zero inflated models as the initial models[^5]. In this case, some of the coefficients are flipped. Missing ratings and outlier acidity values are strong positive influences on sales. Label appeal is similarly positive as in previous models, but actual star ratings are negative. Again, the coefficients for poisson and negative binomial models are identical. 
+
+```{r}
+zinp.mod <- pscl::zeroinfl(formula = target ~ volatileacidity + totalsulfurdioxide + 
+    density + ph + sulphates + alcohol + labelappeal + acidindex + 
+    stars + stars_na.flag + volatileacidity_out.flag + acidindex_out.flag, 
+    data = train)
+
+zinp.coeffs <- data.frame(var = names(zinp.mod$coefficients$zero),
+                            coefficient = zinp.mod$coefficients$zero)%>%
+  mutate(method = 'Zero-Inflated Poisson')
+
+zinng.mod <- pscl::zeroinfl(formula = target ~ volatileacidity + totalsulfurdioxide + 
+    density + ph + sulphates + alcohol + labelappeal + acidindex + 
+    stars + stars_na.flag + volatileacidity_out.flag + acidindex_out.flag, 
+    data = train, dist = "negbin", EM = TRUE)
+
+zinng.coeffs <- data.frame(var = names(zinng.mod$coefficients$zero),
+                            coefficient = zinng.mod$coefficients$zero)%>%
+  mutate(method = 'Zero-Inflated Negative Binomial')
+
+ggplot(bind_rows(zinp.coeffs, zinng.coeffs),
+       aes(x = reorder(var, coefficient), y = coefficient, fill = method))+
+  geom_col(position = 'dodge')+
+  coord_flip()+
+  labs(y = 'Coefficient',
+       x = element_blank(),
+       title = 'Regression Coefficients',
+       subtitle = 'Features selected via backwards variable selection')+
+  scale_fill_manual(name = 'Method', values = yaz_cols[4:5])+
+  theme_yaz()
+```
+
+## Multiple Regression
+The final model attempted is multiple linear regression. A new stepwise selection algorithm is used to select model variables. The same variables with relatively large coefficients in the poisson and negative binomial models stand out in the linear regression model, although additional variables with smaller coefficients are included as well. 
+
+```{r}
+mlr.base <- lm(formula = target ~ ., data = train)
+mlr.step <- stepAIC(mlr.base, direction = 'backward')
+mlr.mod <- lm(formula = target ~ volatileacidity + citricacid + chlorides + 
+    totalsulfurdioxide + density + ph + sulphates + alcohol + 
+    labelappeal + acidindex + stars + residualsugar_na.flag + 
+    stars_na.flag + volatileacidity_out.flag + acidindex_out.flag, 
+    data = train)
+
+mlr.coeffs <- data.frame(var = names(mlr.mod$coefficients),
+                         coefficient = mlr.mod$coefficients)
+
+ggplot(mlr.coeffs, aes(x = reorder(var, coefficient), y = coefficient))+
+  geom_col(fill = yaz_cols[5])+
+  coord_flip()+
+  labs(y = 'Coefficient',
+       x = element_blank(),
+       title = 'Multiple Linear Regression Regression Coefficients',
+       subtitle = 'Features selected via backwards variable selection')+
+  theme_yaz()
+```
+
+# Model Evaluation
+To assess the accuracy of the various models, each model is repeatedly trained on random samples of the data and tested out of sample. Iterative resampling is used to measure the error rates of each model and attempt to account for uncertainty in error measurements by producing distributions of possible error measures rather than single point estimates. The distributions of MAE and RMSE for each model are presented below. Similar to the above coefficients, the error rates for the poisson and negative binomial models are identical with the two zero-inflated models strongly outperforming the non-adjusted models. Multiple regression also made a strong showing, but did not improve predictive accuracy compared to the two zero-inflated models. Of the two winning models, zero-inflated negative binomial is preferred due to the slight overdispersion of the target variable.
+
+```{r, fig.height = 4, fig.width = 8}
+test_mods <- function(df, iterations){
+  method <- c(rep('Poisson', iterations), rep('Negative Binomial',iterations),
+              rep('Zero-Inflated Poisson', iterations),
+              rep('Zero-Inflated Negative Binomial', iterations),
+              rep('Multiple Linear Regression',iterations))
+  poiss.rmse <- c()
+  poiss.mae <- c()
+  negbin.rmse <- c()
+  negbin.mae <- c()
+  zinp.rmse <- c()
+  zinp.mae <- c()
+  zinng.rmse <- c()
+  zinng.mae <- c()
+  mlr.rmse <- c()
+  mlr.mae <- c()
+  for(i in seq(1,iterations)){
+    tempdf <- sample_frac(df, .8)
+    test <- setdiff(df, tempdf)
+    poiss.mod <- glm(formula = target ~ volatileacidity + totalsulfurdioxide +
+        density + ph + sulphates + alcohol + labelappeal + acidindex +
+        stars + stars_na.flag + volatileacidity_out.flag + acidindex_out.flag,
+        family = "poisson", data = tempdf)
+
+    poiss.rmse[i] <- sqrt(mean((predict.glm(poiss.mod, test) - test$target)^2))
+    poiss.mae[i] <- mean(abs(predict.glm(poiss.mod, test) - test$target))
+
+
+    negbin.mod <- glm.nb(formula = target ~ volatileacidity + totalsulfurdioxide +
+        density + ph + sulphates + alcohol + labelappeal + acidindex +
+        stars + stars_na.flag + volatileacidity_out.flag + acidindex_out.flag,
+        data = tempdf)
+
+    negbin.rmse[i] <- sqrt(mean((predict.glm(negbin.mod, test) - test$target)^2))
+    negbin.mae[i] <- mean(abs(predict.glm(negbin.mod, test) - test$target))
+
+    zinp.mod <- pscl::zeroinfl(formula = target ~ volatileacidity + totalsulfurdioxide +
+        density + ph + sulphates + alcohol + labelappeal + acidindex +
+        stars + stars_na.flag + volatileacidity_out.flag + acidindex_out.flag,
+        data = tempdf)
+
+    zinp.rmse[i] <- sqrt(mean((predict(zinp.mod, test) - test$target)^2))
+    zinp.mae[i] <- mean(abs(predict(zinp.mod, test) - test$target))
+
+    zinng.mod <- pscl::zeroinfl(formula = target ~ volatileacidity + totalsulfurdioxide +
+        density + ph + sulphates + alcohol + labelappeal + acidindex +
+        stars + stars_na.flag + volatileacidity_out.flag + acidindex_out.flag,
+        data = tempdf, dist = "negbin", EM = TRUE)
+
+    zinng.rmse[i] <- sqrt(mean((predict(zinng.mod, test) - test$target)^2))
+    zinng.mae[i] <- mean(abs(predict(zinng.mod, test) - test$target))
+
+    mlr.mod <- lm(formula = target ~ volatileacidity + citricacid + chlorides +
+        totalsulfurdioxide + density + ph + sulphates + alcohol +
+        labelappeal + acidindex + stars + residualsugar_na.flag +
+        stars_na.flag + volatileacidity_out.flag + acidindex_out.flag,
+        data = tempdf)
+    mlr.rmse[i] <- sqrt(mean((predict(mlr.mod, test) - test$target)^2))
+    mlr.mae[i] <- mean(abs(predict(mlr.mod, test) - test$target))
+  }
+  return(data.frame(
+    method,
+    rmse = c(poiss.rmse, negbin.rmse, zinp.rmse, zinng.rmse, mlr.rmse),
+    mae = c(poiss.mae, negbin.mae, zinp.mae, zinng.mae, mlr.mae)
+  ))
+}
+model_diagnostics <- test_mods(train, 250)
+
+library(gridExtra)
+library(ggridges)
+library(reshape2)
+
+ggplot(model_diagnostics%>%melt(id.vars = 'method'), aes(x = value, y = method, fill = variable))+
+  geom_density_ridges(alpha = .75)+
+  facet_wrap(~toupper(variable), scales = 'free')+
+  theme_yaz()+
+  labs(title = 'Model Diagnostics by Method',
+       y = element_blank(),
+       x = element_blank())+
+  scale_fill_manual(name = 'Metric', values = yaz_cols[4:5], labels = c('RMSE', 'MAE'))
+```
+
+# Implementation
+The following function applies the zero-inflated negative binomial regression model to out of sample data and generates a CSV file in the proper submission format. 
+```{r}
+apply_model <- function(csv){
+  train.raw <- read_csv(csv)
+  colnames(train_raw) <- tolower(colnames(train_raw))
+  
+  train.flagged <- train_raw%>%
+    mutate_all(funs(na.flag = ifelse(is.na(.),1,0)))
+  int_df <- train.flagged%>%
+    dplyr::select(-index, -target, -index_na.flag, -target_na.flag)%>%
+    dplyr::select_if(is.numeric)
+  
+  cleaned_cols <- list()
+  for(c in colnames(train_raw%>%
+                    dplyr::select(-index, -target)%>%
+                    dplyr::select_if(is.numeric))){
+    column <- train.flagged%>%select_(col = c)
+    iqr <- quantile(column$col, na.rm = T)[4] - quantile(column$col, na.rm = T)[2]
+    low <- quantile(column$col, na.rm = T)[2] - iqr
+    high <- quantile(column$col, na.rm = T)[4] + iqr
+    
+    vals <- c()
+    for(i in seq(1:nrow(int_df))){
+      ifelse(between(column$col[i], low - (1.5*iqr), high + (1.5*iqr)),
+             vals[i] <- column$col[i], 
+             ifelse(is.na(column$col[i]), vals[i] <- NA, vals[i] <- NA))
+    }
+    
+    ifelse(length(vals) == nrow(int_df),
+           cleaned_cols[[c]] <- vals, 
+           cleaned_cols[[c]] <- c(vals,NA))
+  }
+  
+  df2 <- bind_cols(
+    bind_cols(cleaned_cols)%>%
+      scale(center = TRUE)%>%
+      data.frame(),
+    train.flagged%>%
+      dplyr::select(ends_with('na.flag'))%>%
+      dplyr::select(-index_na.flag, -target_na.flag)
+  )
+  
+  df3 <- df2%>%
+    mutate(
+      fixedacidity_out.flag = ifelse(is.na(fixedacidity) & fixedacidity_na.flag ==0,1,0),
+      volatileacidity_out.flag = ifelse(is.na(volatileacidity) & volatileacidity_na.flag ==0,1,0),
+      citricacid_out.flag = ifelse(is.na(citricacid) & citricacid_na.flag ==0,1,0),
+      residualsugar_out.flag = ifelse(is.na(residualsugar) & residualsugar_na.flag ==0,1,0),
+      chlorides_out.flag = ifelse(is.na(chlorides) & chlorides_na.flag ==0,1,0),
+      freesulfurdioxide_out.flag = ifelse(is.na(freesulfurdioxide) & freesulfurdioxide_na.flag ==0,1,0),
+      totalsulfurdioxide_out.flag = ifelse(is.na(totalsulfurdioxide) & totalsulfurdioxide_na.flag ==0,1,0),
+      density_out.flag = ifelse(is.na(density) & density_na.flag ==0,1,0),
+      ph_out.flag = ifelse(is.na(ph) & ph_na.flag ==0,1,0),
+      sulphates_out.flag = ifelse(is.na(sulphates) & sulphates_na.flag ==0,1,0),
+      alcohol_out.flag = ifelse(is.na(alcohol) & alcohol_na.flag ==0,1,0),
+      labelappeal_out.flag = ifelse(is.na(labelappeal) & labelappeal_na.flag ==0,1,0),
+      acidindex_out.flag = ifelse(is.na(acidindex) & acidindex_na.flag ==0,1,0),
+      stars_out.flag = ifelse(is.na(stars) & stars_na.flag ==0,1,0)
+  )
+  
+  library(mice)
+  temp_df <- mice(df3, method = 'cart', maxit = 1)
+  train <- complete(temp_df)%>%
+    bind_cols(train_raw%>%dplyr::select(index))%>%
+    dplyr::select(-stars_out.flag, -labelappeal_out.flag, -density_na.flag,
+                  -labelappeal_na.flag, -acidindex_na.flag, -fixedacidity_na.flag,
+                  -volatileacidity_na.flag, -citricacid_na.flag)
+  return(data.frame(
+    index = train$index,
+    target_p = predict(zinng.mod, newdata = train)
+    )
+  )
+}
+
+test <- apply_model('Wine_Random_Test.csv')
+```
+
+# Citations
+[^1]: Hoffmann, John P. Generalized Linear Models: an Applied Approach. Pearson/Allyn & Bacon, 2004.
+[^2]: https://stats.idre.ucla.edu/r/dae/poisson-regression/
+[^3]: https://stats.idre.ucla.edu/r/dae/negative-binomial-regression/
+[^4]: https://statisticalhorizons.com/zero-inflated-models
+[^5]: https://stats.idre.ucla.edu/r/dae/zip/
