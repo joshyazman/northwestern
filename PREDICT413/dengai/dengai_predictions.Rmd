@@ -1,0 +1,642 @@
+---
+title: "PREDICT 413 - DengAI Challenge"
+author: 'Josh Yazman'
+output: html_notebook
+---
+
+# Introduction
+The goal of this competition is to accurately predict Dengue fever outbreaks in two Peruvian cities: San Juan and Iquitos. The forecasting initiative was launched by the Obama Administration in 2015 and spans several federal agencies [^1]. Dengue fever outbreaks, spread by mosquitoes, effect millions of people per year with epidemic spikes every 3-5 years that lead to significant loss of life[^2]. The data provided consists of weekly dengue cases as well as a host of weather variables measured by the US Navy, NOAA, and others.
+
+First, several exploratory steps are taken to assess data quality and attempt to identify any promising interactions between dengue cases and potential explanatory variables. Then a variety of models are attempted and evaluated on mean absolute error (MAE) with the winning model to be submitted in the [DengAI Challenge](https://www.drivendata.org/competitions/44/dengai-predicting-disease-spread/page/80/) hosted by DrivenData.
+
+# Exploratory Analysis
+The data provided consists of weekly measurements of various ecological and climate data points for two cities in Peru. San Juan has five years of data and Iquitos has three. Fields starting in `ndvi` consist of satellite measurements of vegetation in different proximity to each city[^3]. Several fields measure temerature, precipitation, humidity, and termperature range. Several of these variables appear to be nearly identical metrics, or exhibit strong collinearity because they measure the same target construct (ex: `station_max_temp_c` and `reanalysis_max_air_temp_k`), so some such variables are excluded. 
+
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE}
+library(readr)
+library(dplyr)
+train.raw <- read_csv('dengue_features_train.csv')%>%
+  left_join(read_csv('dengue_labels_train.csv'))
+
+library(ggplot2)
+library(yaztheme)
+# ggsave(plot = GGally::ggpairs(train.raw%>%dplyr::select(-city,-year,-weekofyear, -week_start_date)), 
+#        filename = 'GGally.pdf', height = 20, width = 20)
+
+train.raw.slim <- train.raw%>%
+  dplyr::select(city, year, weekofyear, week_start_date, ndvi_ne, ndvi_nw, ndvi_se, ndvi_sw,
+                reanalysis_precip_amt_kg_per_m2, reanalysis_dew_point_temp_k, reanalysis_avg_temp_k,
+                reanalysis_relative_humidity_percent,reanalysis_tdtr_k, total_cases)
+train.raw.slim.iq <- train.raw.slim%>%filter(city == 'iq')
+train.raw.slim.sj <- train.raw.slim%>%filter(city == 'sj')
+nulls.iq <- data.frame(col = as.character(colnames(train.raw.slim.iq)), 
+                       pct_null = colSums(is.na(train.raw.slim.iq))*100/(colSums(is.na(train.raw.slim.iq))+colSums(!is.na(train.raw.slim.iq))))%>%
+  mutate(city = 'Iquitos')
+nulls.sj <- data.frame(col = as.character(colnames(train.raw.slim.sj)), 
+                       pct_null = colSums(is.na(train.raw.slim.sj))*100/(colSums(is.na(train.raw.slim.sj))+colSums(!is.na(train.raw.slim.sj))))%>%
+  mutate(city = 'San Juan')
+nulls <- bind_rows(nulls.iq, nulls.sj)
+ggplot(nulls, aes(x = col, y = pct_null, fill = city))+
+  geom_bar(stat = 'identity', position = 'dodge')+
+  coord_flip()+
+  labs(title = 'Distribution of Missing Data',
+       x = element_blank(), y = 'Percent of Data Missing')+
+  theme_yaz()+
+  ylim(0,100)+
+  scale_fill_manual(name = 'City', values = yaz_cols[c(4,6)])
+ggsave('Missing Values.pdf', width = 6, height = 4)
+```
+
+Missing values and outliers are flagged and reimputed using regression trees from the `mice` R package. The resulting dataset contains 1,456 observations with 30 variables after homogeneous flags are removed (there's no sense including a missing values flag for a variable that does not have missing values!). The distributions and relationships of the non-flagged variables are presented below separated by city. Since each city has different climate and vegetation patterns, the time series are split and forecasts are made separately.
+
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE}
+library(mice)
+# Iquitos
+train.flagged_iq <- train.raw.slim%>%
+  filter(city == 'iq')%>%
+  mutate_all(funs(na.flag = ifelse(is.na(.),1,0)))
+
+int_df.iq <- train.flagged_iq%>%
+  dplyr::select(-year, -week_start_date, -total_cases)%>%
+  dplyr::select_if(is.numeric)%>%
+  dplyr::select(-ends_with('na.flag'))
+
+cleaned_cols.iq <- list()
+for(c in colnames(int_df.iq)){
+  column <- int_df.iq%>%dplyr::select_(col = c)
+  iqr <- quantile(column$col, na.rm = T)[4] - quantile(column$col, na.rm = T)[2]
+  low <- quantile(column$col, na.rm = T)[2] - iqr
+  high <- quantile(column$col, na.rm = T)[4] + iqr
+  
+  vals <- c()
+  for(i in seq(1:nrow(int_df.iq))){
+    ifelse(between(column$col[i], low - (1.5*iqr), high + (1.5*iqr)),
+           vals[i] <- column$col[i], 
+           ifelse(is.na(column$col[i]), vals[i] <- NA, vals[i] <- NA))
+  }
+  
+  ifelse(length(vals) == nrow(int_df.iq),
+         cleaned_cols.iq[[c]] <- vals, 
+         cleaned_cols.iq[[c]] <- c(vals,NA))
+}
+
+df2 <- bind_cols(
+  bind_cols(cleaned_cols.iq)%>%
+    scale(center = TRUE)%>%
+    data.frame(),
+  train.flagged_iq%>%
+    dplyr::select(ends_with('na.flag'))
+)
+
+df3 <- df2%>%
+  mutate(
+    weekofyear_out.flag = ifelse(is.na(weekofyear) & weekofyear_na.flag == 0, 1, 0),
+    ndvi_ne_out.flag = ifelse(is.na(ndvi_ne) & ndvi_ne_na.flag == 0, 1, 0),
+    ndvi_nw_out.flag = ifelse(is.na(ndvi_nw) & ndvi_nw_na.flag == 0, 1, 0),
+    ndvi_se_out.flag = ifelse(is.na(ndvi_se) & ndvi_se_na.flag == 0, 1, 0),
+    ndvi_sw_out.flag = ifelse(is.na(ndvi_sw) & ndvi_sw_na.flag == 0, 1, 0),
+    reanalysis_precip_amt_kg_per_m2_out.flag = ifelse(is.na(reanalysis_precip_amt_kg_per_m2) & 
+                                                        reanalysis_precip_amt_kg_per_m2_na.flag ==0,1,0),
+    reanalysis_dew_point_temp_k_out.flag = ifelse(is.na(reanalysis_dew_point_temp_k) & reanalysis_dew_point_temp_k_na.flag ==0,1,0),
+    reanalysis_avg_temp_k_out.flag = ifelse(is.na(reanalysis_avg_temp_k) & reanalysis_avg_temp_k_na.flag ==0,1,0),
+    reanalysis_relative_humidity_percent_out.flag = ifelse(is.na(reanalysis_relative_humidity_percent) & 
+                                                             reanalysis_relative_humidity_percent_na.flag ==0,1,0),
+    reanalysis_tdtr_k_out.flag = ifelse(is.na(reanalysis_tdtr_k) & reanalysis_tdtr_k_na.flag ==0,1,0)
+)
+
+temp_df <- mice(df3, method = 'cart', maxit = 1)
+train.iq <- complete(temp_df)%>%
+  bind_cols(train.flagged_iq%>%
+              dplyr::select(city, year, week_start_date, total_cases))%>%
+              dplyr::select(-city_na.flag, -year_na.flag, -weekofyear_na.flag, -week_start_date_na.flag, -total_cases_na.flag,
+                            -weekofyear_out.flag, -ndvi_ne_out.flag, -ndvi_nw_out.flag, -ndvi_se_out.flag, -ndvi_sw_out.flag,
+                            -reanalysis_dew_point_temp_k_out.flag, -reanalysis_avg_temp_k_out.flag, 
+                            -reanalysis_tdtr_k_out.flag)
+# San Juan
+train.flagged_sj <- train.raw.slim%>%
+  filter(city == 'sj')%>%
+  mutate_all(funs(na.flag = ifelse(is.na(.),1,0)))
+
+int_df.sj <- train.flagged_sj%>%
+  dplyr::select(-year, -week_start_date, -total_cases)%>%
+  dplyr::select_if(is.numeric)%>%
+  dplyr::select(-ends_with('na.flag'))
+
+cleaned_cols.sj <- list()
+for(c in colnames(int_df.sj)){
+  column <- int_df.sj%>%dplyr::select_(col = c)
+  iqr <- quantile(column$col, na.rm = T)[4] - quantile(column$col, na.rm = T)[2]
+  low <- quantile(column$col, na.rm = T)[2] - iqr
+  high <- quantile(column$col, na.rm = T)[4] + iqr
+  
+  vals <- c()
+  for(i in seq(1:nrow(int_df.sj))){
+    ifelse(between(column$col[i], low - (1.5*iqr), high + (1.5*iqr)),
+           vals[i] <- column$col[i], 
+           ifelse(is.na(column$col[i]), vals[i] <- NA, vals[i] <- NA))
+  }
+  
+  ifelse(length(vals) == nrow(int_df.sj),
+         cleaned_cols.sj[[c]] <- vals, 
+         cleaned_cols.sj[[c]] <- c(vals,NA))
+}
+
+df2 <- bind_cols(
+  bind_cols(cleaned_cols.sj)%>%
+    scale(center = TRUE)%>%
+    data.frame(),
+  train.flagged_sj%>%
+    dplyr::select(ends_with('na.flag'))
+)
+
+df3 <- df2%>%
+  mutate(
+    weekofyear_out.flag = ifelse(is.na(weekofyear) & weekofyear_na.flag == 0, 1, 0),
+    ndvi_ne_out.flag = ifelse(is.na(ndvi_ne) & ndvi_ne_na.flag == 0, 1, 0),
+    ndvi_nw_out.flag = ifelse(is.na(ndvi_nw) & ndvi_nw_na.flag == 0, 1, 0),
+    ndvi_se_out.flag = ifelse(is.na(ndvi_se) & ndvi_se_na.flag == 0, 1, 0),
+    ndvi_sw_out.flag = ifelse(is.na(ndvi_sw) & ndvi_sw_na.flag == 0, 1, 0),
+    reanalysis_precip_amt_kg_per_m2_out.flag = ifelse(is.na(reanalysis_precip_amt_kg_per_m2) & 
+                                                        reanalysis_precip_amt_kg_per_m2_na.flag ==0,1,0),
+    reanalysis_dew_point_temp_k_out.flag = ifelse(is.na(reanalysis_dew_point_temp_k) & reanalysis_dew_point_temp_k_na.flag ==0,1,0),
+    reanalysis_avg_temp_k_out.flag = ifelse(is.na(reanalysis_avg_temp_k) & reanalysis_avg_temp_k_na.flag ==0,1,0),
+    reanalysis_relative_humidity_percent_out.flag = ifelse(is.na(reanalysis_relative_humidity_percent) & 
+                                                             reanalysis_relative_humidity_percent_na.flag ==0,1,0),
+    reanalysis_tdtr_k_out.flag = ifelse(is.na(reanalysis_tdtr_k) & reanalysis_tdtr_k_na.flag ==0,1,0)
+)
+df3%>%dplyr::select(contains('flag'))%>%summarise_each(funs(sum))
+temp_df <- mice(df3, method = 'cart', maxit = 1)
+train.sj <- complete(temp_df)%>%
+  bind_cols(train.flagged_sj%>%
+            dplyr::select(city, year, week_start_date, total_cases))%>%
+            dplyr::select(-city_na.flag, -year_na.flag, -weekofyear_na.flag, -week_start_date_na.flag, total_cases_na.flag,
+                          -reanalysis_dew_point_temp_k_out.flag, -reanalysis_avg_temp_k_out.flag, 
+                          -reanalysis_relative_humidity_percent_out.flag)
+iquitos_dists <- GGally::ggpairs(train.iq%>%
+                                   dplyr::select(-contains('flag'))%>%
+                                   dplyr::select(-year, -week_start_date, -city))+
+  theme_yaz()
+sanjuan_dists <- GGally::ggpairs(train.sj%>%
+                                   dplyr::select(-contains('flag'))%>%
+                                   dplyr::select(-year, -week_start_date, -city))+
+  theme_yaz()
+ggsave(plot = iquitos_dists,file = 'Iquitos Distributions.pdf', width = 12, height = 12)
+ggsave(plot = sanjuan_dists,file = 'San Juan Distributions.pdf', width = 12, height = 12)
+```
+
+## Iquitos
+
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width=12, fig.height=12}
+iquitos_dists
+```
+
+## San Juan
+
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width=12, fig.height=12}
+sanjuan_dists
+```
+
+Decomposition is an exploratory technique for separating out seasonal fluxuations and trends from a time series. Decompositions of total cases for each city demonstrate clear seasonality corresponding to summers, which makes sense for a mosquito-borne virus. There is no clear long term trend of outbreaks increasing or decreasing, but epidemics are evident in 2011 for Iquitos and 2004 for San Juan.
+
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width=10, fig.height=6}
+library(forecast)
+library(gridExtra)
+iq.ts <- ts(train.iq, frequency = 52, start = c(2007,07,01))
+sj.ts <- ts(train.sj, frequency = 52, start = c(1990,04,30))
+decompositions <- grid.arrange(
+  autoplot(decompose(iq.ts[,'total_cases']))+labs(title = 'Decomposition - Iquitos')+theme_yaz(),
+  autoplot(decompose(sj.ts[,'total_cases']))+labs(title = 'Decomposition - San Juan')+theme_yaz(),
+  nrow = 1
+)
+ggsave(plot = decompositions, file = 'City Decompositions.pdf', width = 12, height = 8)
+```
+
+# Model Development
+Four models are attempted: OLS regression, negative binomial regression, ARIMA, and the Holt-Winters seasonal method (holt-winters). 
+
+## Linear Regression
+The first method attemped is an ordinary least squares multiple linear regression model. A bi-directional step-wise algorithm is used to select variables that minimize AIC for each city separately. Then a linear model is fit using the resulting parameters and results are reported. 
+
+### Iquitos
+The AIC minimizing linear regression model for Iquitos uses vegetation levels south of the city, dew point, humitidy, temperature ranges, and the presence of precipitation outliers to explain variation in the number of fever cases. But the model doesn't explain much with $Adj. R^2 = .06$. The model fits the typical seasonal trends nicely, but does little to call out the epidemics from 2011-2015. Higher dew point temperatures and vegetation southwest of the city predict increased fever incidence, while higher temperature ranges and humidity levels predict lower incidences. 
+
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width = 12, fig.height=6}
+library(MASS)
+# Iquitos
+base.mlr.iq <- lm(total_cases~., data = train.iq%>%dplyr::select(-city, -year, -week_start_date))
+step.mlr.iq <- stepAIC(object = base.mlr.iq, direction = 'both')
+mlr.mod.iq <- eval(step.mlr.iq$call)
+
+mlr.coefs.iq <- summary(mlr.mod.iq)[4]%>%data.frame()%>%
+  bind_cols(var = rownames(summary(mlr.mod.iq)[4]%>%data.frame()))%>%
+  filter(var != '(Intercept)')
+
+mlr.coef_plot.iq <- ggplot(mlr.coefs.iq, aes(x = reorder(var, coefficients.Estimate), y = coefficients.Estimate))+
+  geom_errorbar(aes(ymin = coefficients.Estimate - coefficients.Std..Error,
+                    ymax = coefficients.Estimate + coefficients.Std..Error),
+                width = .15, color= yaz_cols[6])+
+  geom_point(color = yaz_cols[4], size = 2)+
+  geom_hline(yintercept = 0, linetype = 'dashed')+
+  labs(title = "OLS Coefficients - Iquitos",
+       subtitle = 'Error bars represent one standard error',
+       y = 'Coefficient Estimate',
+       x = element_blank())+
+  theme_yaz()+
+  theme(axis.text.x = element_text(angle = 90))
+fit.plot.mlr.iq <- data.frame(orig = train.iq$total_cases, 
+                              predicted = mlr.mod.iq$fitted.values)%>%
+  ts(frequency = 52, start = c(2000,07,01))%>%
+  autoplot()+
+  scale_x_continuous(breaks = c(2000, 2002, 2004, 2006, 2008, 2010))+
+  scale_color_manual(labels = c('Observed', 'Fitted'), values = yaz_cols[c(4,6)], name = element_blank())+
+  theme_yaz()+
+  labs(title = 'Fitted vs. Observed Values - Iquitos',
+       x = element_blank(), y = 'Total Cases')
+ggsave(plot = grid.arrange(fit.plot.mlr.iq, mlr.coef_plot.iq, widths = c(3,1.5)),
+       file = 'MLR Fit Plots - Iquitos.pdf', width = 10, height = 5)
+grid.arrange(fit.plot.mlr.iq, mlr.coef_plot.iq, widths = c(3,1))
+```
+
+Analysis of model residuals illustrates clear violations of the assumptions that residuals should be normally distributed and have homoskedastic relationships with predictors. The model tends to have trouble when dew point and humidity are higher and when precipitation is not an outlier. Additionally, model performance is worse when vegetation levels are lower. 
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width = 10, fig.height=10}
+coef_names <- summary(mlr.mod.iq)$coefficients%>%rownames()
+mlr.iq.diagnotsics <- train.iq%>%dplyr::select_(.dots = coef_names[-1])%>%
+  bind_cols(data.frame(residuals = mlr.mod.iq$residuals))
+diag.plot.mlr.iq <- GGally::ggpairs(mlr.iq.diagnotsics)
+ggsave(plot = diag.plot.mlr.iq+theme_yaz(), file = 'MLR Diagnostics - Iquitos.pdf', width = 10, height = 10)
+diag.plot.mlr.iq+theme_yaz()
+```
+
+### San Juan
+The AIC minimizing linear regression model for San Juan explains 43% of the variation in the data with eight variables. Predicted values catch some of teh spikes in fever incidence, but also raise some false alarms (such as the two overpredictions in 1993 and 1994). Additionally, the fitted values dip below zero at several points in the time series, which is unfortunately impossible for a count of fever cases. Perhaps a negative binomial regression model will be more appropriate given the distribution of the data available. 
+
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width = 12, fig.height=6}
+# Iquitos
+base.mlr.sj <- lm(total_cases~., data = train.sj%>%dplyr::select(-city, -year, -week_start_date))
+step.mlr.sj <- stepAIC(object = base.mlr.sj, direction = 'both')
+mlr.mod.sj <- eval(step.mlr.sj$call)
+
+mlr.coefs.sj <- summary(mlr.mod.sj)[4]%>%data.frame()%>%
+  bind_cols(var = rownames(summary(mlr.mod.sj)[4]%>%data.frame()))%>%
+  filter(var != '(Intercept)')
+
+mlr.coef_plot.sj <- ggplot(mlr.coefs.sj, aes(x = reorder(var, coefficients.Estimate), y = coefficients.Estimate))+
+  geom_errorbar(aes(ymin = coefficients.Estimate - coefficients.Std..Error,
+                    ymax = coefficients.Estimate + coefficients.Std..Error),
+                width = .15, color= yaz_cols[6])+
+  geom_point(color = yaz_cols[4], size = 2)+
+  geom_hline(yintercept = 0, linetype = 'dashed')+
+  labs(title = "OLS Coefficients - San Juan",
+       subtitle = 'Error bars represent one standard error',
+       y = 'Coefficient Estimate',
+       x = element_blank())+
+  theme_yaz()+
+  theme(axis.text.x = element_text(angle = 90))
+fit.plot.mlr.sj <- data.frame(orig = train.sj$total_cases, 
+                              predicted = mlr.mod.sj$fitted.values)%>%
+  ts(frequency = 52, start = c(1990,04,30))%>%
+  autoplot()+
+  scale_color_manual(labels = c('Observed', 'Fitted'), values = yaz_cols[c(4,6)], name = element_blank())+
+  theme_yaz()+
+  labs(title = 'Fitted vs. Observed Values - San Juan',
+       x = element_blank(), y = 'Total Cases')
+ggsave(plot = grid.arrange(fit.plot.mlr.sj, mlr.coef_plot.sj, widths = c(3,1.5)),
+       file = 'MLR Fit Plots - San Juan.pdf', width = 10, height = 5)
+grid.arrange(fit.plot.mlr.sj, mlr.coef_plot.sj, widths = c(3,1.5))
+```
+
+the fitted already illustrate serious problems with OLS regression applied to prediction of fever cases, but residuals plots also illustrate problems with the assumption of homoskedasticity of residuals across the various predictor variables.
+
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width = 10, fig.height=10}
+coef_names <- summary(mlr.mod.sj)$coefficients%>%rownames()
+mlr.sj.diagnotsics <- train.sj%>%dplyr::select_(.dots = coef_names[-1])%>%
+  bind_cols(data.frame(residuals = mlr.mod.sj$residuals))
+diag.plot.mlr.sj <- GGally::ggpairs(mlr.sj.diagnotsics)
+ggsave(plot = diag.plot.mlr.sj+theme_yaz(), file = 'MLR Diagnostics - San Juan.pdf', width = 10, height = 10)
+diag.plot.mlr.sj+theme_yaz()
+```
+
+## Negative Binomial Regression
+OLS regression relies on a set of assumptions that the distribution of weekly fever cases does not necessarily meet. A more appropriate model would be a generalized linear model like Poisson regression or it's cousin, negative binomial regression. Both methods are more appropriate for counts variables than OLS is[^4]. Again, a bi-directional stepwise variable selection technique is used to minimize AIC of all possible models[^5]. This time the regression coefficient represents the log marginal change in total cases. Exponentiated coefficients and standard errors are presented for each city.
+
+### Iquitos
+The negative binomal model tracks actual fever incidence similarly to the pattern in the linear regression model and uses the same coefficients. Again, dew point and southwest vegetation drive the largest marginal effects, but unlike linear regression, all coefficient estimates are positive.  
+
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width = 12, fig.height=6}
+base_nb.iq <- glm.nb(total_cases ~ ., data=train.iq%>%dplyr::select(-city, -week_start_date, -year))
+nb.back.iq <- stepAIC(base_nb.iq, direction = 'both')
+negbin.mod.iq <- glm.nb(eval(nb.back.iq$call))
+negbin.coeffs.iq <- summary(negbin.mod.iq)$coefficients%>%data.frame()%>%
+  dplyr::select(estimate = Estimate, ste = Std..Error)%>%
+  mutate(estimate = exp(estimate), ste = exp(ste))%>%
+  bind_cols(data.frame(variable = names(negbin.mod.iq$coefficients)))%>%
+  filter(variable != '(Intercept)')
+
+nb.coef_plot.iq <- ggplot(negbin.coeffs.iq, aes(x = reorder(variable, estimate), y = estimate))+
+  geom_errorbar(aes(ymin = estimate - ste,
+                    ymax = estimate + ste),
+                width = .15, color= yaz_cols[6])+
+  geom_point(color = yaz_cols[4], size = 2)+
+  geom_hline(yintercept = 0, linetype = 'dashed')+
+  labs(title = "Negative Binomial Coefficients\nIquitos",
+       subtitle = 'Error bars represent one standard error',
+       y = 'Exponentiated Coefficient Estimate',
+       x = element_blank())+
+  theme_yaz()+
+  theme(axis.text.x = element_text(angle = 90))
+fit.plot.nb.iq <- data.frame(orig = train.iq$total_cases, 
+                             predicted = negbin.mod.iq$fitted.values)%>%
+  ts(frequency = 52, start = c(2000,07,01))%>%
+  autoplot()+
+  scale_x_continuous(breaks = c(2000, 2002, 2004, 2006, 2008, 2010))+
+  scale_color_manual(labels = c('Observed', 'Fitted'), values = yaz_cols[c(4,6)], name = element_blank())+
+  theme_yaz()+
+  labs(title = 'Fitted vs. Observed Values - Iquitos',
+       x = element_blank(), y = 'Total Cases')
+ggsave(plot = grid.arrange(fit.plot.nb.iq, nb.coef_plot.iq, widths = c(3,1.5)),
+       file = 'Negative Binomial Fit Plots - Iquitos.pdf', width = 10, height = 5)
+grid.arrange(fit.plot.nb.iq, nb.coef_plot.iq, widths = c(3,1.5))
+```
+
+The residuals look a bit better than those from the OLS regression model. While residuals are not normally distributed, there are less clear relationships between errors in the model and the model's input variables.
+```{r}
+negbin.iq.diagnotsics <- train.iq%>%dplyr::select_(.dots = negbin.coeffs.iq$variable)%>%
+  bind_cols(data.frame(residuals = negbin.mod.iq$residuals))
+diag.plot.mlr.sj <- GGally::ggpairs(negbin.iq.diagnotsics)
+ggsave(plot = diag.plot.mlr.sj+theme_yaz(), file = 'Negbin Diagnostics - Iquitos.pdf', width = 10, height = 10)
+```
+
+### San Juan
+This time many of the missing data and outlier flags are included in the AIC minimizing negative binomial model. Removing such flags resulted in a model that essentially just tracks the seasonality of fever outbreaks but misses all epidemic spikes. Removing just missing data flags fits the data slightly better. The biggest driver of fever outbreaks in this case is the presence of outlier level temperature ranges. 
+
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width = 12, fig.height=6}
+base_nb.sj <- glm.nb(total_cases ~ ., data=train.sj%>%
+                       dplyr::select(-city, -week_start_date, -year)%>%
+                       dplyr::select(-contains('na.flag')))
+nb.back.sj <- stepAIC(base_nb.sj, direction = 'both')
+negbin.mod.sj <- glm.nb(eval(nb.back.sj$call))
+negbin.coeffs.sj <- summary(negbin.mod.sj)$coefficients%>%data.frame()%>%
+  dplyr::select(estimate = Estimate, ste = Std..Error)%>%
+  mutate(estimate = exp(estimate), ste = exp(ste))%>%
+  bind_cols(data.frame(variable = rownames(summary(negbin.mod.sj)$coefficients)))%>%
+  filter(variable != '(Intercept)')
+autoplot(ts(train.sj%>%select_(.dots = )))
+nb.coef_plot.sj <- ggplot(negbin.coeffs.sj, aes(x = reorder(variable, estimate), y = estimate))+
+  geom_errorbar(aes(ymin = estimate - ste,
+                    ymax = estimate + ste),
+                width = .15, color= yaz_cols[6])+
+  geom_point(color = yaz_cols[4], size = 2)+
+  geom_hline(yintercept = 0, linetype = 'dashed')+
+  labs(title = "Negative Binomial Coefficients\nSan Juan",
+       subtitle = 'Error bars represent one standard error',
+       y = 'Exponentiated Coefficient Estimate',
+       x = element_blank())+
+  theme_yaz()+
+  theme(axis.text.x = element_text(angle = 90))
+fit.plot.nb.sj <- data.frame(orig = train.sj$total_cases, 
+                             predicted = negbin.mod.sj$fitted.values)%>%
+  ts(frequency = 52, start = c(1990,04,30))%>%
+  autoplot()+
+  scale_color_manual(labels = c('Observed', 'Fitted'), values = yaz_cols[c(4,6)], name = element_blank())+
+  theme_yaz()+
+  labs(title = 'Fitted vs. Observed Values - San Juan',
+       x = element_blank(), y = 'Total Cases')
+ggsave(plot = grid.arrange(fit.plot.nb.sj, nb.coef_plot.sj, widths = c(3,1.5)),
+       file = 'Negative Binomial Fit Plots - San Juan.pdf', width = 10, height = 5)
+grid.arrange(fit.plot.nb.sj, nb.coef_plot.sj, widths = c(3,1.5))
+```
+
+The residuals look a bit better than those from the OLS regression model. While residuals are not normally distributed, there are less clear relationships between errors in the model and the model's input variables.
+```{r}
+negbin.sj.diagnotsics <- train.sj%>%dplyr::select_(.dots = negbin.coeffs.sj$variable)%>%
+  bind_cols(data.frame(residuals = negbin.mod.sj$residuals))
+diag.plot.mlr.sj <- GGally::ggpairs(negbin.sj.diagnotsics)
+ggsave(plot = diag.plot.mlr.sj+theme_yaz(), file = 'Negbin Diagnostics - San Juan.pdf', width = 10, height = 10)
+```
+
+## Holt-Winters Seasonal Method
+The Holt-Winters method contains functions for exponential smoothing of trend, level, and seasonality. This is promising due to the obvious summer seasonality in fever incidence for each city[^6]. For implementation in the `forecast` R package, the data has to be condensed to the month level[^7]. Again, models are trained separately for each city, but no external regressors are considered. 
+
+### Iquitos
+Holt-Winters appears to fit the data quite well in Iquitos with the exception of a few early values that dip below zero. The pattern of fitted values traces that of the observed values, but slightly lagged. Residuals are mostly clustered around zero, but there are some outliers.
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width = 12, fig.height=6}
+library(lubridate)
+
+iq.ts.cases <- train.iq%>%
+  mutate(month = floor_date(week_start_date, 'months'))%>%
+  group_by(month)%>%
+  summarise(cases = sum(total_cases))%>%
+  dplyr::select(cases)%>%
+  ts(frequency = 12, start = c(2007,07,01))
+  
+hw.fit.iq <- hw(iq.ts.cases)
+hw.fitplot.iq <- arrangeGrob(
+  autoplot(iq.ts.cases, series = 'Observed')+
+    autolayer(fitted(hw.fit.iq), series = 'Fitted')+
+    scale_color_manual(values = yaz_cols[c(4,6)])+
+    labs(title = 'Fitted vs. Original Values - Iquitos',
+         y = 'Monthly Fever Cases',
+         x = element_blank())+
+    theme_yaz(),
+  ggplot(data.frame(r = hw.fit.iq$residuals), aes(r))+
+    geom_density(fill = yaz_cols[3], alpha = .75)+
+    coord_flip()+
+    labs(title = 'Residuals - Iquitos',
+         x = 'Residual', y = 'Density')+
+    theme_yaz(),
+  nrow = 1,
+  widths = c(3,1.5)
+)
+
+ggsave(plot = hw.fitplot.iq, file = 'Holt-Winters Fit Plot.pdf', width = 10, height = 5)
+```
+
+### San Juan
+The Holt-Winters model performs similarly in San Juan as it does in Iquitos. This makes sense because the model does not take external variables (like vegetation, temperature, etc) into account so those variables cannot impact fitted values the way they have in previous models. Again, the residuals are mostly normally distributed but have heavy tails on either end of the distribution.
+
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width = 12, fig.height=6}
+sj.ts.cases <- train.sj%>%
+  mutate(month = floor_date(week_start_date, 'months'))%>%
+  group_by(month)%>%
+  summarise(cases = sum(total_cases))%>%
+  dplyr::select(cases)%>%
+  ts(frequency = 12, start = c(2000,07,01))
+  
+hw.fit.sj <- hw(sj.ts.cases)
+hw.fitplot.sj <- arrangeGrob(
+  autoplot(sj.ts.cases, series = 'Observed')+
+    autolayer(fitted(hw.fit.sj), series = 'Fitted')+
+    scale_color_manual(values = yaz_cols[c(4,6)])+
+    labs(title = 'Fitted vs. Original Values - San Juan',
+         y = 'Monthly Fever Cases',
+         x = element_blank())+
+    theme_yaz(),
+  ggplot(data.frame(r = hw.fit.sj$residuals), aes(r))+
+    geom_density(fill = yaz_cols[3], alpha = .75)+
+    coord_flip()+
+    labs(title = 'Residuals - San Juan',
+         x = 'Residual', y = 'Density')+
+    theme_yaz(),
+  nrow = 1,
+  widths = c(3,1.5)
+)
+ggsave(plot = hw.fitplot.sj, file = 'Holt-Winters Fit Plot San Juan.pdf', width = 10, height = 5)
+```
+
+## Seasonal ARIMA Models
+ARIMA, autoregression with integrated moving averages, models combine regression with lagged variables and moving averages to produce forecast estimates[^8]. Since this is essentially a regression process, the same regressors from the OLS models are used as external regressors in the ARIMA models for each city.
+
+### Iquitos
+The `auto.arima()` function in R returns an ARIMA(1,0,4) model fllowing a stepwise model selection process. This process is not comprehensive, so there is a chance a better ARIMA model could be developed with more thorough explorations of the possible models, but this appears to work nicely. The timeline of fitted values traces the observed values as well as the Holt-Winters models did, but without the time lag. Residual values, as a result, are more tightly distributed. There are still outlier events (like the outbreak in 2011), but the model gets closer to fitting those outcomes than not. 
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width = 12, fig.height=6}
+ts.iq <- ts(train.iq, frequency = 52, start = c(2000,07,01))
+arima.fit.iq <- auto.arima(ts.iq[,'total_cases'], seasonal = T,
+                           xreg = ts.iq[,c('ndvi_se','ndvi_sw','reanalysis_dew_point_temp_k',
+                                           'reanalysis_relative_humidity_percent','reanalysis_tdtr_k',
+                                           'reanalysis_precip_amt_kg_per_m2_out.flag')])
+
+arima.fitplot.iq <- arrangeGrob(
+  autoplot(ts.iq[,'total_cases'], series = 'Observed')+
+    autolayer(fitted(arima.fit.iq), series = 'Fitted')+
+    scale_color_manual(values = yaz_cols[c(4,6)])+
+    labs(title = 'Fitted vs. Original Values - Iquitos',
+         y = 'Weekly Fever Cases',
+         x = element_blank())+
+    theme_yaz(),
+  ggplot(data.frame(r = arima.fit.iq$residuals), aes(r))+
+    geom_density(fill = yaz_cols[3], alpha = .75)+
+    coord_flip()+
+    labs(title = 'Residuals - Iquitos',
+         x = 'Residual', y = 'Density')+
+    theme_yaz(),
+  nrow = 1,
+  widths = c(3,1.5)
+)
+ggsave(plot = arima.fitplot.iq, file = 'ARIMA Fit Plot Iquitos.pdf', width = 10, height = 5)
+
+arima.iq.diagnotsics <- train.iq%>%
+  dplyr::select_('ndvi_se','ndvi_sw','reanalysis_dew_point_temp_k', 'reanalysis_precip_amt_kg_per_m2_out.flag',
+                 'reanalysis_relative_humidity_percent','reanalysis_tdtr_k')%>%
+  bind_cols(data.frame(residuals = arima.fit.iq$residuals))
+diag.plot.arima.iq <- GGally::ggpairs(arima.iq.diagnotsics)
+ggsave(plot = diag.plot.arima.iq+theme_yaz(), file = 'ARIMA Diagnostics - Iquitos.pdf', width = 10, height = 10)
+forecast(arima.fit.iq, h = 50)
+```
+
+### San Juan
+The `auto.arima()` function in R returns an ARIMA(1,0,4) model fllowing a stepwise model selection process. This process is not comprehensive, so there is a chance a better ARIMA model could be developed with more thorough explorations of the possible models, but this appears to work nicely. The timeline of fitted values traces the observed values as well as the Holt-Winters models did, but without the time lag. Residual values, as a result, are more tightly distributed. There are still outlier events (like the outbreak in 2011), but the model gets closer to fitting those outcomes than not. 
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE, fig.width = 12, fig.height=6}
+ts.sj <- ts(train.sj, frequency = 52, start = c(1990,04,30))
+arima.fit.sj <- auto.arima(ts.sj[,'total_cases'], seasonal = T,
+                           xreg = ts.sj[,c('weekofyear','ndvi_nw','reanalysis_precip_amt_kg_per_m2',
+                                           'reanalysis_dew_point_temp_k','reanalysis_relative_humidity_percent',
+                                           'ndvi_se_na.flag','reanalysis_precip_amt_kg_per_m2_na.flag',
+                                           'reanalysis_tdtr_k_out.flag')])
+
+
+arima.fitplot.sj <- arrangeGrob(
+  autoplot(ts.sj[,'total_cases'], series = 'Observed')+
+    autolayer(fitted(arima.fit.sj), series = 'Fitted')+
+    scale_color_manual(values = yaz_cols[c(4,6)])+
+    labs(title = 'Fitted vs. Original Values - San Juan',
+         y = 'Weekly Fever Cases',
+         x = element_blank())+
+    theme_yaz(),
+  ggplot(data.frame(r = arima.fit.sj$residuals), aes(r))+
+    geom_density(fill = yaz_cols[3], alpha = .75)+
+    coord_flip()+
+    labs(title = 'Residuals - San Juan',
+         x = 'Residual', y = 'Density')+
+    theme_yaz(),
+  nrow = 1,
+  widths = c(3,1.5)
+)
+ggsave(plot = arima.fitplot.sj, file = 'ARIMA Fit Plot San Juan.pdf', width = 10, height = 5)
+
+arima.sj.diagnotsics <- train.sj%>%
+  dplyr::select_('weekofyear','ndvi_nw','reanalysis_precip_amt_kg_per_m2','reanalysis_dew_point_temp_k',
+                 'reanalysis_relative_humidity_percent', 'ndvi_se_na.flag', 'reanalysis_precip_amt_kg_per_m2_na.flag',
+                 'reanalysis_tdtr_k_out.flag')%>%
+  bind_cols(data.frame(residuals = arima.fit.sj$residuals))
+diag.plot.arima.sj <- GGally::ggpairs(arima.sj.diagnotsics)
+ggsave(plot = diag.plot.arima.sj+theme_yaz(), file = 'ARIMA Diagnostics - San Juan.pdf', width = 10, height = 10)
+
+```
+
+# Model Evaluation and Selection
+Four model types have been attempted so far: OLS Linear Regression, Negative Binomial Regression, Holt-Winters Seasonal Smoothing, and ARIMA. The competition mandate is to minimize mean absolute error (MAE). Holt-Winters made the least accruate predictions in each city likely because of the lag in making otherwise decent predictions. Linear regression made a poor showing in San Juan, which makes sense because the linear regression model really only captured the seasonality of the data and San Juan saw some large spikes in fever outbreaks on several occasions. Failing to capture the epidemics in any way led to large errors there. 
+
+The final two models are a split decision. In Iquitos, the ARIMA model performed best whereas the negative binomial regression model performed best in San Juan. Recall that the initial AIC minimizing negative binomial model included several missing data flags, which were then removed manually to achieve a more sensible fit. It could be the case that missing data did not signal anything in the data and missing data flags should have been excluded from all models. San Juan could also just be harder to make any predictions for due to the large epidemic in 2011.
+
+```{r, echo = FALSE, results=FALSE, message = FALSE, error=FALSE}
+mae <- c(
+  accuracy(arima.fit.iq)[3], accuracy(arima.fit.sj)[3], accuracy(hw.fit.iq)[3], accuracy(hw.fit.sj)[3],
+  accuracy(negbin.mod.iq)[3], accuracy(negbin.mod.iq)[3], accuracy(mlr.mod.iq)[3], accuracy(mlr.mod.sj)[3]
+)
+method <- c(
+  'ARIMA', 'ARIMA', 'Holt-Winters', 'Holt-Winters', 'Negative Binomial', 'Negative Binomial', 
+  'Linear Regression', 'Linear Regression'
+)
+city <- rep(c('Iquitos', 'San Juan'),4)
+
+model_health <- data.frame(mae, method, city)
+
+ggplot(model_health, aes(x = method, y = mae, fill = city))+
+  geom_col(position = 'dodge')+
+  scale_fill_manual(name = 'City', values = yaz_cols[c(3,1)])+
+  theme_yaz()+
+  labs(title = 'Mean Absolute Error by Model and City',
+       x = element_blank(),
+       y = element_blank())
+ggsave(file = 'Mean Absolute Error by Model and City.pdf', width = 8, height = 4)
+```
+
+# Limitations and Future Work
+One glaring limitation of the data is the lack of information on governance and infrastructure. Since dengue fever is transmitted by mosquitoes, it makes sense that a large amount of variance in fever incidence can be explained by environmental variables that make life easier or harder for mosquitoes. That said, data on the number and quality of medical service providers, access to hospitals, the economic health of each city, and other governance and lifestyle factors could be helpful links. Additionally, this project did not attempt an exhaustive list of forecasting methods. Future work could involve a more exhaustive search for the AIC minimizing ARIMA model and development and testing of GARCH, neural network, and vector autoregression models. Finally, an approach I might explore in the future is a hybrid model using ARIMA to model all independent variables and a negative binomial model with future values as inputs to predict the number of fever cases. 
+
+# Conclusion
+For submission to the DengAI competition, the ARIMA model is used to fit inferences for Iquitos and the negative binomial regression model is used for San Juan. A logical next question may be to ask what the future holds for Iquitos and San Juan in terms of dengue fever. 
+
+```{r}
+sj.proj <- forecast(object = arima.fit.sj, xreg = ts.sj[,c('weekofyear','ndvi_nw','reanalysis_precip_amt_kg_per_m2',
+                                           'reanalysis_dew_point_temp_k','reanalysis_relative_humidity_percent',
+                                           'ndvi_se_na.flag','reanalysis_precip_amt_kg_per_m2_na.flag',
+                                           'reanalysis_tdtr_k_out.flag')],
+         h = 260)
+sj.projections <- data.frame(sj.proj)%>%
+  bind_cols(data.frame(dates = rownames(data.frame(sj.proj))))%>%
+  filter(floor(as.numeric(as.character(dates))) >= 2008,
+         floor(as.numeric(as.character(dates))) <= 2014)%>%
+  head(260)
+iq.proj <- forecast(object = arima.fit.iq, xreg = ts.iq[,c('ndvi_se','ndvi_sw','reanalysis_dew_point_temp_k',
+                                           'reanalysis_relative_humidity_percent','reanalysis_tdtr_k',
+                                           'reanalysis_precip_amt_kg_per_m2_out.flag')],
+         h = 156)
+iq.projections <- data.frame(iq.proj)%>%
+  bind_cols(data.frame(dates = rownames(data.frame(iq.proj))))%>%
+  filter(floor(as.numeric(as.character(dates))) >= 2010,
+         floor(as.numeric(as.character(dates))) <= 2013)%>%
+  head(156)
+projections <- bind_rows(sj.projections, iq.projections)%>%
+  dplyr::select(total_cases = Point.Forecast)%>%
+  mutate(total_cases = round(total_cases))
+test_data <- read_csv('submission_format.csv')%>%dplyr::select(-total_cases)
+
+submission <- bind_cols(
+  test_data,
+  projections
+)
+
+write.csv(submission, 'yazman_submission.csv', row.names = FALSE)
+```
+
+
+[^1]: https://www.drivendata.org/competitions/44/dengai-predicting-disease-spread/page/81/
+[^2]: https://obamawhitehouse.archives.gov/blog/2015/06/05/back-future-using-historical-dengue-data-predict-next-epidemic
+[^3]: https://earthobservatory.nasa.gov/Features/MeasuringVegetation/measuring_vegetation_2.php
+[^4]: Hoffmann, John P. Generalized Linear Models: an Applied Approach. Pearson/Allyn & Bacon, 2004.
+[^5]: Zhao, Lili; Wu, Weisheng; Feng, Dai; Jiang, Hui; Nguyen, XuanLong. Bayesian Analysis of RNA-Seq Data Using a Family of Negative Binomial Models. Bayesian Anal., advance publication, 8 April 2017. doi:10.1214/17-BA1055. https://projecteuclid.org/euclid.ba/1491616976
+[^6]: Gelper, S., Fried, R., & Croux, C. (2010). Robust forecasting with exponential and Holt-Winters smoothing. Journal of Forecasting, 29(3), 285-300.
+[^7]: https://stackoverflow.com/questions/28550208/why-ets-function-in-r-is-not-fitting-a-seasonal-model
+[^8]: Jarrett, J., & Kyper, E. (n.d.). ARIMA Modeling with Intervention to Forecast and Analyze Chinese Stock Prices. International Journal of Engineering Business Management, 3, International Journal of Engineering Business Management, 2011, Vol.3.
+[^9]: Hyndman, R.J. and Khandakar, Y. (2008) "Automatic time series forecasting: The forecast package for R", Journal of Statistical Software, 26(3).
