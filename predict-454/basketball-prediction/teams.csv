@@ -1,0 +1,348 @@
+team,Opponent,team_id
+youngstown state,Youngstown State,1
+yale,Yale,2
+xavier,Xavier,3
+wyoming,Wyoming,4
+wright state,Wright State,5
+wofford,Wofford,6
+wisconsin,Wisconsin,7
+winthrop,Winthrop,8
+william mary,William & Mary,9
+wichita state,Wichita State,10
+western michigan,Western Michigan,11
+western kentucky,Western Kentucky,12
+western illinois,Western Illinois,13
+western carolina,Western Carolina,14
+west virginia,West Virginia,15
+weber state,Weber State,16
+washington state,Washington State,17
+washington,Washington,18
+wake forest,Wake Forest,19
+wagner,Wagner,20
+virginia tech,Virginia Tech,21
+virginia military institute,Virginia Military Institute,22
+virginia,Virginia,23
+villanova,Villanova,24
+vermont,Vermont,25
+virginia commonwealth,VCU,26
+vanderbilt,Vanderbilt,27
+valparaiso,Valparaiso,28
+texas san antonio,UTSA,29
+tennessee martin,UT-Martin,30
+texas el paso,UTEP,31
+utah valley,Utah Valley,32
+utah state,Utah State,33
+utah,Utah,34
+southern california,USC,35
+nevada las vegas,UNLV,36
+california,University of California,37
+north carolina,UNC,38
+missouri kansas city,UMKC,39
+maryland baltimore county,UMBC,40
+massachusetts lowell,UMass-Lowell,41
+massachusetts,Umass,42
+illinois chicago,UIC,43
+california santa barbara,UCSB,44
+california riverside,UC-Riverside,45
+connecticut,UConn,46
+ucla,UCLA,47
+california irvine,UC-Irvine,48
+central florida,UCF,49
+california davis,UC-Davis,50
+tulsa,Tulsa,51
+tulane,Tulane,52
+troy,Troy,53
+towson,Towson,54
+toledo,Toledo,55
+texas arlington,Texas-Arlington,56
+texas tech,Texas Tech,57
+texas state,Texas State,58
+texas southern,Texas Southern,59
+texas christian,Texas Christian,60
+texas am corpus christi,Texas A&M-Corpus Christi,61
+texas am,Texas A&M,62
+texas,Texas,63
+tennessee tech,Tennessee Tech,64
+tennessee state,Tennessee State,65
+tennessee,Tennessee,66
+temple,Temple,67
+syracuse,Syracuse,68
+stony brook,Stony Brook,69
+stetson,Stetson,70
+stephen f austin,Stephen F. Austin,71
+stanford,Stanford,72
+saint peters,St. Peter's,73
+saint josephs,St. Joseph's,74
+st johns ny,St. John's (NY),75
+st francis ny,St. Francis (NY),76
+st bonaventure,St. Bonaventure,77
+southern utah,Southern Utah,78
+Southern Miss,Southern Miss,79
+southern illinois edwardsville,Southern Illinois-Edwardsville,80
+southern illinois,Southern Illinois,81
+southern,Southern,82
+southeastern louisiana,Southeastern Louisiana,83
+southeast missouri state,Southeast Missouri State,84
+south florida,South Florida,85
+south dakota state,South Dakota State,86
+south dakota,South Dakota,87
+south carolina upstate,South Carolina Upstate,88
+south carolina state,South Carolina State,89
+south carolina,South Carolina,90
+south alabama,South Alabama,91
+southern methodist,SMU,92
+siena,Siena,93
+seton hall,Seton Hall,94
+seattle,Seattle,95
+savannah state,Savannah State,96
+santa clara,Santa Clara,97
+san jose state,San Jose State,98
+san francisco,San Francisco,99
+san diego state,San Diego State,100
+san diego,San Diego,101
+samford,Samford,102
+sam houston state,Sam Houston State,103
+saint marys ca,Saint Mary's (CA),104
+saint louis,Saint Louis,105
+saint francis pa,Saint Francis (PA),106
+sacred heart,Sacred Heart,107
+sacramento state,Sacramento State,108
+rutgers,Rutgers,109
+robert morris,Robert Morris,110
+rider,Rider,111
+richmond,Richmond,112
+rice,Rice,113
+rhode island,Rhode Island,114
+radford,Radford,115
+quinnipiac,Quinnipiac,116
+purdue,Purdue,117
+providence,Providence,118
+princeton,Princeton,119
+presbyterian,Presbyterian,120
+prairie view,Prairie View,121
+portland state,Portland State,122
+portland,Portland,123
+pittsburgh,Pitt,124
+pepperdine,Pepperdine,125
+penn state,Penn State,126
+pennsylvania,Penn,127
+pacific,Pacific,128
+oregon state,Oregon State,129
+oregon,Oregon,130
+oral roberts,Oral Roberts,131
+mississippi,Ole Miss,132
+old dominion,Old Dominion,133
+oklahoma state,Oklahoma State,134
+oklahoma,Oklahoma,135
+ohio state,Ohio State,136
+ohio,Ohio,137
+oakland,Oakland,138
+notre dame,Notre Dame,139
+northwestern state,Northwestern State,140
+northwestern,Northwestern,141
+northern kentucky,Northern Kentucky,142
+northern iowa,Northern Iowa,143
+northern illinois,Northern Illinois,144
+northern colorado,Northern Colorado,145
+northern arizona,Northern Arizona,146
+northeastern,Northeastern,147
+north texas,North Texas,148
+north florida,North Florida,149
+north dakota state,North Dakota State,150
+north dakota,North Dakota,151
+north carolina wilmington,North Carolina-Wilmington,152
+north carolina greensboro,North Carolina-Greensboro,153
+north carolina asheville,North Carolina-Asheville,154
+north carolina state,North Carolina State,155
+north carolina central,North Carolina Central,156
+north carolina at,North Carolina A&T,157
+norfolk state,Norfolk State,158
+njit,NJIT,159
+nicholls state,Nicholls State,160
+niagara,Niagara,161
+new orleans,New Orleans,162
+new mexico state,New Mexico State,163
+new mexico,New Mexico,164
+new hampshire,New Hampshire,165
+nevada,Nevada,166
+nebraska omaha,Nebraska-Omaha,167
+nebraska,Nebraska,168
+navy,Navy,169
+murray state,Murray State,170
+mount st marys,Mt. St. Mary (NY),171
+morgan state,Morgan State,172
+morehead state,Morehead State,173
+montana state,Montana State,174
+montana,Montana,175
+monmouth,Monmouth,176
+missouri state,Missouri State,177
+missouri,Missouri,178
+mississippi valley state,Mississippi Valley State,179
+mississippi state,Mississippi State,180
+minnesota,Minnesota,181
+milwaukee,Milwaukee,182
+middle tennessee,Middle Tennessee,183
+michigan state,Michigan State,184
+michigan,Michigan,185
+miami oh,Miami (OH),186
+miami fl,Miami (FL),187
+mercer,Mercer,188
+memphis,Memphis,189
+mcneese state,McNeese State,190
+maryland eastern shore,Maryland-Eastern Shore,191
+maryland,Maryland,192
+marshall,Marshall,193
+marquette,Marquette,194
+marist,Marist,195
+manhattan,Manhattan,196
+maine,Maine,197
+louisiana state,LSU,198
+loyola marymount,Loyola Marymount,199
+loyola md,Loyola (MD),200
+loyola il,Loyola (IL),201
+louisville,Louisville,202
+louisiana monroe,Louisiana-Monroe,203
+louisiana lafayette,Louisiana-Lafayette,204
+louisiana tech,Louisiana Tech,205
+longwood,Longwood,206
+long beach state,Long Beach State,207
+lipscomb,Lipscomb,208
+liberty,Liberty,209
+lehigh,Lehigh,210
+lamar,Lamar,211
+lafayette,Lafayette,212
+la salle,La Salle,213
+kentucky,Kentucky,214
+kent state,Kent State,215
+kennesaw state,Kennesaw State,216
+kansas state,Kansas State,217
+kansas,Kansas,218
+james madison,James Madison,219
+jacksonville state,Jacksonville State,220
+jacksonville,Jacksonville,221
+jackson state,Jackson State,222
+iupui,IUPUI,223
+ipfw,IPFW,224
+iowa state,Iowa State,225
+iowa,Iowa,226
+iona,Iona,227
+indiana state,Indiana State,228
+indiana,Indiana,229
+incarnate word,Incarnate Word,230
+illinois state,Illinois State,231
+illinois,Illinois,232
+idaho state,Idaho State,233
+idaho,Idaho,234
+howard,Howard,235
+houston baptist,Houston Baptist,236
+houston,Houston,237
+holy cross,Holy Cross,238
+hofstra,Hofstra,239
+high point,High Point,240
+hawaii,Hawaii,241
+harvard,Harvard,242
+hartford,Hartford,243
+hampton,Hampton,244
+green bay,Green Bay,245
+grand canyon,Grand Canyon,246
+grambling,Grambling,247
+gonzaga,Gonzaga,248
+georgia tech,Georgia Tech,249
+georgia state,Georgia State,250
+georgia southern,Georgia Southern,251
+georgia,Georgia,252
+georgetown,Georgetown,253
+george washington,George Washington,254
+george mason,George Mason,255
+gardner webb,Gardner-Webb,256
+furman,Furman,257
+fresno state,Fresno State,258
+fordham,Fordham,259
+florida state,Florida State,260
+florida international,Florida International,261
+florida gulf coast,Florida Gulf Coast,262
+florida atlantic,Florida Atlantic,263
+florida am,Florida A&M,264
+florida,Florida,265
+fairleigh dickinson,Fairleigh Dickinson,266
+fairfield,Fairfield,267
+evansville,Evansville,268
+east tennessee state,ETSU,269
+elon,Elon,270
+eastern washington,Eastern Washington,271
+eastern michigan,Eastern Michigan,272
+eastern kentucky,Eastern Kentucky,273
+eastern illinois,Eastern Illinois,274
+east carolina,East Carolina,275
+duquesne,Duquesne,276
+duke,Duke,277
+drexel,Drexel,278
+drake,Drake,279
+depaul,DePaul,280
+denver,Denver,281
+delaware state,Delaware State,282
+delaware,Delaware,283
+dayton,Dayton,284
+davidson,Davidson,285
+dartmouth,Dartmouth,286
+creighton,Creighton,287
+cornell,Cornell,288
+coppin state,Coppin State,289
+columbia,Columbia,290
+colorado state,Colorado State,291
+colorado,Colorado,292
+college of charleston,College of Charleston,293
+colgate,Colgate,294
+coastal carolina,Coastal Carolina,295
+cleveland state,Cleveland State,296
+clemson,Clemson,297
+citadel,Citadel,298
+cincinnati,Cincinnati,299
+chicago state,Chicago State,300
+chattanooga,Chattanooga,301
+charlotte,Charlotte,302
+charleston southern,Charleston Southern,303
+central michigan,Central Michigan,304
+central arkansas,Central Arkansas,305
+canisius,Canisius,306
+campbell,Campbell,307
+cal state northridge,Cal State Northridge,308
+cal state fullerton,Cal State Fullerton,309
+cal state bakersfield,Cal State Bakersfield,310
+cal poly,Cal Poly,311
+brigham young,BYU,312
+butler,Butler,313
+buffalo,Buffalo,314
+bucknell,Bucknell,315
+bryant,Bryant,316
+brown,Brown,317
+bradley,Bradley,318
+bowling green state,Bowling Green State,319
+boston university,Boston University,320
+boston college,Boston College,321
+boise state,Boise State,322
+binghamton,Binghamton,323
+bethune cookman,Bethune-Cookman,324
+belmont,Belmont,325
+baylor,Baylor,326
+ball state,Ball State,327
+austin peay,Austin Peay,328
+auburn,Auburn,329
+army,Army,330
+arkansas pine bluff,Arkansas-Pine Bluff,331
+arkansas little rock,Arkansas-Little Rock,332
+arkansas state,Arkansas State,333
+arkansas,Arkansas,334
+arizona state,Arizona State,335
+arizona,Arizona,336
+appalachian state,Appalachian State,337
+american,American,338
+alcorn state,Alcorn State,339
+albany ny,Albany (NY),340
+alabama birmingham,Alabama-Birmingham,341
+alabama state,Alabama State,342
+alabama am,Alabama A&M,343
+alabama,Alabama,344
+akron,Akron,345
+air force,Air Force,346
+abilene christian,Abilene Christian,347

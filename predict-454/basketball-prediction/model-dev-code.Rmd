@@ -1,0 +1,505 @@
+---
+title: "Modeling College Basketball Outcomes"
+output: html_notebook
+---
+
+## Statement of Problem
+The primary goal of this analysis is to accurately predict win-likelihood in college basketball games. As a secondary goal, I'd like to attempt to predict score differentials. As a starting point, I'll use LDA, logistic regression, and a boosted classification tree for the classification portion and compare the results. 
+
+## Data Prep
+I read in the data and change some column names. Then I calculate the spreads and normalize each stat on a per-40 minutes basis to avoid giving extra weight to games that go to overtime. One area of concern will be multicollinearity problems inherent in including mirroring stats in the same model (a team with lots of field goal attempts for will likely also have a lot of field goal attempts against).
+
+Since the data comes from game logs for each team, a large number of games will be duplicates. When downloading the data, team was pulled from a different place than Opponent and team in one instance will be opponent in the other, a lookup table is necessary to reconcile the differences and standardize team names.  Then an ID field needs to be combined with date to create a gameid and then de-dupe on it. Development of the lookup table was done in Excel quite tediously.
+
+
+```{r}
+library(dplyr)
+library(readr)
+source('file_formater.R')
+train_files <- clean_format('cleaned_games.csv')
+train.scaled <- train_files[[1]]
+# write.csv(train.scaled, 'train_scale_overall.csv', row.names = F)
+test_files <- clean_format('cleaned_games2018.csv')
+test.scaled <- test_files[[1]]
+# write.csv(test.scaled, 'test_scale_overall.csv', row.names = F)
+```
+
+##Data Exploration
+Using the `GGally` package, I generate two sets of ggpairs plots and save them as pdfs. The first contains shooting/scoring efficiency stats as well as assists. The second looks at the rest of the stats. They're broken up so the plots render in sufficient size/detail to be visible.
+
+```{r}
+library(GGally)
+library(ggplot2)
+library(yaztheme)
+# Scaled Scoring Distributions
+ggsave(
+  ggpairs(train.scaled%>%
+            select(mean_spread_diff, mean_fg_pct_spread_diff, mean_shots_for_diff,
+                   mean_shots_against_diff, mean_three_pct_diff, mean_threes_against_diff,
+                   mean_threes_for_diff, mean_ft_against_diff, mean_ft_for_diff, mean_ft_pct_diff,
+                   mean_assist_against_diff, mean_assist_for_diff, mean_assist_spread_diff,
+                   point.spread)),
+  file = 'Offensive Pairwise Distributions.pdf',
+  height = 15, width = 15
+)
+
+ggsave(
+  ggpairs(train.scaled%>%
+            select(contains('steal'), contains('block'), contains('orb'),
+                   contains('drb'), contains('foul'), contains('tov'),
+                   point.spread)),
+  file = 'Defensive Pairwise Distributions.pdf',
+  height = 15, width = 15
+)
+
+# Initial correlations 
+var_cors <- data.frame(rsq = (cor(train.scaled%>%select(-contains('_id'), -outcome))^2)[,35],
+                       varname = cor(train.scaled%>%select(-contains('_id'), -outcome))%>%colnames())
+ggplot(var_cors%>%filter(varname != 'point.spread'), 
+       aes(x = reorder(gsub('_',' ',gsub('_diff','',varname)), rsq), y = rsq))+
+  geom_col(fill = yaz_cols[1])+
+  coord_flip()+
+  labs(title = 'Fig 1: Correlation Coefficient For Potential Predictor Variables',
+       y = 'R-Squared',
+       x = element_blank())+
+  theme_yaz()
+ggsave('Fig 1-Correlation Coefficient For Potential Predictor Variables.pdf',
+       width = 8, height = 5)
+```
+
+# Point Spread Regression
+## Heuristic Variable Selection
+The first regression attempt involved eyeballing the scatter plots from the exploratory analysis and building a regression model with just the variables that appeared to have the tightest relationship with time spent. Those are difference in field goal percentage and three point percentage as well as differences in the number of defensive rebounds, blocks, and turnovers. All coefficients are significant and the model explains 90% of the variation in point spread. 
+```{r}
+heur.lm.fit <- lm(point.spread~mean_fg_pct_spread_diff+mean_drb_spread_diff+
+                    mean_assist_spread_diff+mean_spread_diff, 
+                  data = train.scaled)
+heur.lm.pred <- data.frame(prediction = predict(heur.lm.fit, newdata = test.scaled))
+heur.lm.diag <- bind_cols(test.scaled%>%
+            select(point.spread, mean_fg_pct_spread_diff, mean_drb_spread_diff, 
+                   mean_assist_spread_diff, mean_spread_diff),
+          heur.lm.pred)%>%
+  mutate(error = point.spread - prediction)%>%
+  select(-prediction)
+
+data.frame(Predicted = heur.lm.pred$prediction,
+           Actual = test.scaled$point.spread)%>%
+  reshape2::melt()%>%
+  ggplot(ggplot2::aes(x = value, y = variable, fill = variable))+
+  ggridges::geom_density_ridges(alpha = .7)+
+  labs(title = 'Linear Model Predicted vs. Actual Values',
+       x = 'Point Spread', y = element_blank())+
+  theme_yaz()+
+  scale_fill_manual(name = element_blank(), values = yaz_cols[c(3,4)])
+ggsave('Linear Model Predicted vs. Actual Values.pdf', width = 6, height = 4)
+ggsave(
+  ggpairs(heur.lm.diag, columnLabels = c('Observed Spread','FG Pct Spread',
+                                         'Def. Rebound Spread','Assist Spread',
+                                         'Mean A Priori Spread','Error'))+
+    labs(title = 'Fig 2: Heuristic Variable Selection Diagnostics')+
+    theme_yaz(),
+  filename = 'Fig 2-Manual Variable Selection Diagnostics.pdf',
+       height = 8, width = 8)
+mean(heur.lm.diag$error)
+```
+
+## LASSO
+The first step here is to use cross-validation to determine the optimal value for lambda, which turns out to be .258
+```{r}
+library(glmnet)
+M = model.matrix(point.spread~.,data = train.scaled%>%select(-contains('_id'),-outcome))[,-1]
+y = train.scaled$point.spread
+grid=10^seq(10,-2, length =100)
+lasso.fit.test <- glmnet(M,y, alpha = 1, lambda = grid)
+
+# test for optimal lambda value
+set.seed(1)
+cv.out=cv.glmnet(M,y,alpha=1)
+cv_df <- data.frame(lambda = cv.out$lambda, high = cv.out$cvup, low = cv.out$cvlo)
+ggplot(cv_df, aes(x = log(lambda), y = high))+
+  geom_errorbar(aes(ymin = low, ymax = high),
+                colour = yaz_cols[1])+
+  labs(title = 'Fig 3: Cross-Validated MSE by Lambda Value',
+       x = 'Log(Lambda)',
+       y = 'Mean Squared Error')+
+  theme_yaz()+
+  annotate('text', x = cv.out$lambda.min, y = 140, 
+           label = paste0('Optimal Lambda:\n',round(cv.out$lambda.min,4)))
+ggsave('Fig 3 - Cross-Validated MSE by Lambda Value.pdf', height = 4, width = 6)
+```
+
+Now we need to build a LASSO regression model using lambda = .258
+```{r}
+test.m <- model.matrix(point.spread~.,data = test.scaled%>%select(-contains('_id'),-outcome))[,-1]
+lasso.fit<-glmnet(test.m,
+                  test.scaled$point.spread,
+                  alpha = 1, 
+                  lambda = cv.out$lambda.min)
+coefficients <- predict(lasso.fit, type = 'coefficient', s = cv.out$lambda.min, newx = test.m)
+coef_df <- data.frame(coefficients = coefficients[,1],
+                      variable = row.names(coefficients))
+ggplot(coef_df, aes(x = reorder(gsub('_',' ',gsub('_diff','',variable)), coefficients),
+                    y = coefficients))+
+  geom_col(fill = yaz_cols[1])+
+  coord_flip()+
+  labs(title = 'Fig 4: LASSO Coefficients',
+       x = element_blank(),
+       y = 'Coefficient')+
+  theme_yaz()
+ggsave('Fig 4-LASSO Coefficients.pdf', width = 6, height = 6)
+lasso.pred = as.vector(predict(lasso.fit, type = 'response', s = cv.out$lambda.min, newx = test.m))
+```
+
+## Least Angle Regression
+Least Angle Regression follows a similar process to bi-directional stepwise variable selection. A model is initiated using the variable with the highest correlation with the target (point spread). Then the coefficient for the predictor variable is adjusted until another variable has a higher correlation than it does, at which point the first coefficient is locked into the motions of the next coefficient and the process is repeated until the optimal model is found. The process adds variables iteratively, as would be done in a forward step-wise approach, but "only enters 'as much' of a predictor as it deserves" (HFT p73).
+```{r}
+library(lars)
+lar.samp <- train.scaled%>%
+                   select(-contains('_id'), -outcome)%>%
+                   filter(complete.cases(.)==T)
+M = model.matrix(point.spread~.,data = lar.samp)
+lars.fit <- lars(x = M,
+                 y = lar.samp$point.spread,
+                 type = 'lar')
+a <- summary(lars.fit)
+
+# Print out coefficients at optimal s.
+coeffs <- data.frame(coefficients = coef(lars.fit, s=8, mode="step"),
+                     variable = gsub('_',' ',
+                                     gsub('_diff','',
+                                          row.names(data.frame(coef(lars.fit, s=8, mode="step")))
+                                          )))
+ggplot(coeffs%>%filter(coefficients!=0),
+       aes(x = reorder(variable, coefficients), y = coefficients))+
+  geom_col(fill = yaz_cols[1])+
+  labs(title = 'Fig 5: Least Angle Coefficients',
+       x = element_blank(),
+       y = 'Coefficient Estimate',
+       caption = 'Source | sports-reference.com\nChart | Josh Yazman (@jyazman2012)')+
+  coord_flip()+
+  theme_yaz()
+
+ggsave('Fig 5-LAR Coefficients.pdf', height = 4, width = 6)
+
+test.m = model.matrix(point.spread~.,data = test.scaled%>%
+                        select(-contains('_id'),-outcome)%>%
+                        filter(complete.cases(.)==T)) 
+lar.lm.pred <- predict(lars.fit, 
+                       newx = test.m, 
+                       type = 'fit')
+
+summary(lm(test.scaled$point.spread~lasso.pred))
+summary(lm(test.scaled$point.spread~lar.lm.pred$fit))
+
+lar.rmse <- c()
+for(i in seq(1,35)){
+  temp.pred <- lar.lm.pred$fit[,i]
+  lar.rmse[i] <- sqrt(mean((test.scaled$point.spread - temp.pred)^2))
+}
+plot(lar.rmse)
+```
+
+## Boosted Regression Tree
+The hyperparameter to tune here is tree depth. The first loop here tests a range of possible tree depth values with 1000 trees. The winner is the depth that minimizes root mean squared error.
+```{r}
+library(gbm)
+bt.rmse <- c()
+for(i in seq(1,15)){
+  temp.boost.fit <- gbm(point.spread~., 
+                        data = train.scaled%>%select(-contains('_id'),-outcome), 
+                        distribution = 'gaussian',
+                        n.trees=1000,
+                        interaction.depth=i)
+  temp.pred <- predict(temp.boost.fit, newdata = test.scaled, n.trees=1000, type = 'response')
+  bt.rmse[i] <- sqrt(mean((test.scaled$point.spread - temp.pred)^2))
+}
+
+boost.fit <- gbm(point.spread~., 
+                 data = train.scaled%>%select(-contains('_id'),-outcome), 
+                 distribution = 'gaussian',
+                 n.trees = 10000,
+                 interaction.depth = 6)
+boost.pred <- predict(boost.fit, newdata = test.scaled, n.trees=10000, type = 'response')
+```
+
+## Random Forest
+```{r}
+library(randomForest)
+rf.fit <- randomForest(point.spread~., data = train.scaled%>%select(-contains('_id'),-outcome))
+rf.pred <- predict(rf.fit, newdata = test.scaled)
+```
+
+## Evaluating Regression Models
+Models are evaluated in their own right by Root Mean Squared Error. But models are also scored on classification error rates because the end goal is to use point spread predictions in a classification model.
+
+```{r}
+# Scatter plots of observed vs. predicted values
+library(reshape2)
+test.df <- test.scaled%>%select(point.spread, outcome)%>%
+  bind_cols(data.frame(heuristic = heur.lm.pred$prediction,
+                       lasso = lasso.pred,
+                       least_angle = lar.lm.pred$fit[,3],
+                       boosted_tree = boost.pred,
+                       random_forest = rf.pred))%>%
+  melt(id.vars = c('point.spread','outcome'))%>%
+  mutate(error = point.spread - value,
+         variable = tools::toTitleCase(gsub('_',' ',variable)))
+
+ggplot(test.df, aes(x = value, y = point.spread))+
+  facet_wrap(~variable)+
+  geom_point(alpha = .5, color = yaz_cols[1])+
+  geom_abline(slope = 1)+
+  labs(title = 'Fig 6: Predicted vs. Observed Point Spreads',
+       x = 'Predicted Point Spread',
+       y = 'Observed Point Spread',
+       caption = 'Source | sports-reference.com\nChart | Josh Yazman (@jyazman2012)')+
+  theme_yaz()
+ggsave('Fig 6-Predicted vs. Observed Point Spreads.pdf', width = 6, height = 5)
+# Ridgeline plot of modeled vs. observed distributions
+library(ggridges)
+ggplot(test.scaled%>%select(point_spread = point.spread)%>%
+         bind_cols(data.frame(heuristic = heur.lm.pred$prediction,
+                              lasso = lasso.pred,
+                              least_angle = lar.lm.pred$fit[,3],
+                              boosted_tree = boost.pred,
+                              random_forest = rf.pred))%>%
+         melt()%>%
+         mutate(variable = tools::toTitleCase(gsub('_',' ',variable)),
+                colme = ifelse(variable == 'Point Spread','Observed','Modeled')), 
+       aes(x = value, y = variable, fill = colme))+
+  geom_density_ridges(alpha = .7)+
+  scale_fill_manual(name = element_blank(), values= yaz_cols[3:4])+
+  labs(title = 'Fig 7: Distribution of Predicted and Observed Point Spreads',
+       x = 'Point Spread',
+       y = element_blank(),
+       caption = 'Source | sports-reference.com\nChart | Josh Yazman (@jyazman2012)')+
+  theme_yaz()
+ggsave('Fig 7-Distribution of Predicted and Observed Point Spreads.pdf',
+       width = 6.5, height = 5)
+# Box plots of point spread by model and outcome
+box.df <- test.scaled%>%select(observed = point.spread, outcome)%>%
+  bind_cols(data.frame(heuristic = heur.lm.pred$prediction,
+                       lasso = lasso.pred,
+                       least_angle = lar.lm.pred$fit[,3],
+                       boosted_tree = boost.pred,
+                       random_forest = rf.pred))%>%
+  mutate(outcome = ifelse(outcome == 1, 'Win','Loss'))%>%
+  melt(id.vars = 'outcome')%>%
+  mutate(variable = tools::toTitleCase(gsub('_',' ',variable)),
+         colme = ifelse(variable == 'Point Spread','Observed','Modeled'),
+         value = as.numeric(value))
+
+ggplot(box.df, aes(x = variable, y = value, fill = outcome))+
+  geom_boxplot()+
+  labs(title = 'Fig 8: Point Spread Distribution by Outcome',
+       x = element_blank(),
+       y = 'Point Spread',
+       caption = 'Source | sports-reference.com\nChart | Josh Yazman (@jyazman2012)')+
+  theme_yaz()+
+  scale_fill_manual(name = 'Outcome', values = yaz_cols[c(3,1)])
+ggsave('Fig 8-Point Spread Distribution by Outcome.pdf',width = 6, height = 4)
+# Classification Error
+class.start.df <- test.scaled%>%select(outcome)%>%
+  bind_cols(data.frame(heuristic = heur.lm.pred$prediction,
+                       lasso = lasso.pred,
+                       least_angle = lar.lm.pred$fit[,3],
+                       boosted_tree = boost.pred,
+                       random_forest = rf.pred))%>%
+  mutate(heuristic = ifelse(heuristic > 0 & outcome == 1, 1,0),
+         lasso = ifelse(lasso > 0 & outcome == 1, 1,0),
+         least_angle = ifelse(least_angle > 0 & outcome == 1, 1,0),
+         boosted_tree = ifelse(boosted_tree > 0 & outcome == 1, 1,0),
+         random_forest = ifelse(random_forest > 0 & outcome == 1, 1,0))%>%
+  select(-outcome)%>%
+  melt()%>%
+  mutate(variable = tools::toTitleCase(gsub('_',' ',variable)))
+
+class.df.boot <- list()
+for(i in seq(1,1000)){
+  class.df.boot[[i]] <- class.start.df%>%
+    sample_frac(1,replace = T)%>%
+    group_by(method = variable)%>%
+    summarise(accuracy = mean(value))
+}
+
+class_acc <- bind_rows(class.df.boot)%>%
+  group_by(method)%>%
+  summarise(mean_acc = mean(accuracy),
+            high = quantile(accuracy, .95),
+            low = quantile(accuracy, .05))
+
+ggplot(class_acc, aes(x = reorder(method, mean_acc), y = mean_acc))+
+  geom_errorbar(color = yaz_cols[4], width = .2, size = 1.5, aes(ymin = low, ymax = high))+
+  # geom_point(color = yaz_cols[7], size = 3)+
+  coord_flip()+
+  labs(title = 'Fig 9: Point Spread Classification Accuracy',
+       subtitle = 'Percentage of games accurately classified using only modeled point spread',
+       y = 'Classification Accuracy',
+       x = element_blank(),
+       caption = 'Source | sports-reference.com\nChart | Josh Yazman (@jyazman2012)')+
+  theme_yaz()
+
+ggsave('Fig 9-Point Spread Classification Accuracy.pdf', width = 6, height = 4)
+```
+
+# Classification Modeling
+Predicting win probabilities. Now including the random forest point projections
+```{r}
+class.test.scaled <- bind_cols(test.scaled, 
+                         data.frame(modeled_spread = scale(as.vector(rf.pred))))%>%
+  select(-point.spread)
+
+class.train.scaled <- bind_cols(train.scaled,
+                          data.frame(modeled_spread = scale(as.vector(predict(rf.fit, train.scaled)))))%>%
+  select(-point.spread)
+# write.csv(test.scaled, 'test_scaled.csv', row.names = F)
+# write.csv(train.scaled, 'train.scaled.csv', row.names = F)
+# train.scaled <- read_csv('train.scaled.csv')
+# test.scaled <- read_csv('test_scaled.csv')
+ggsave(
+  ggpairs(train.scaled%>%
+            select(mean_spread_diff, mean_fg_pct_spread_diff, mean_shots_for_diff,
+                   mean_shots_against_diff, mean_three_pct_diff, mean_threes_against_diff,
+                   mean_threes_for_diff, mean_ft_against_diff, mean_ft_for_diff, mean_ft_pct_diff,
+                   mean_assist_against_diff, mean_assist_for_diff, mean_assist_spread_diff,
+                   outcome)),
+  file = 'Outcome - Offensive Pairwise Distributions.pdf',
+  height = 15, width = 15
+)
+
+ggsave(
+  ggpairs(train.scaled%>%
+            select(contains('steal'), contains('block'), contains('orb'),
+                   contains('drb'), contains('foul'), contains('tov'),
+                   outcome)),
+  file = 'Outcome - Defensive Pairwise Distributions.pdf',
+  height = 15, width = 15
+)
+```
+
+## LASSO Logistic Regression
+Running a LASSO regularization process for logistic regression variable selection
+```{r}
+library(glmnet)
+M = model.matrix(outcome~.,data = class.train.scaled%>%select(-contains('_id')))[,-1]
+y = class.train.scaled$outcome
+grid=10^seq(10,-2, length =100)
+lasso.fit.test <- glmnet(M,y, alpha = 1, lambda = grid, family = 'binomial')
+
+# test for optimal lambda value
+set.seed(1)
+cv.out=cv.glmnet(M,y,alpha=1, family = 'binomial')
+cv_df <- data.frame(lambda = cv.out$lambda, high = cv.out$cvup, low = cv.out$cvlo)
+
+test.m <- model.matrix(outcome~.,data = class.test.scaled%>%select(-contains('_id')))[,-1]
+lasso.fit<-glmnet(test.m,
+                  test.scaled$outcome,
+                  alpha = 1, 
+                  lambda = cv.out$lambda.min,
+                  family = 'binomial')
+coefficients <- predict(lasso.fit, type = 'coefficient', s = cv.out$lambda.min, newx = test.m)
+coef_df <- data.frame(coefficients = coefficients[,1],
+                      variable = row.names(coefficients))
+ggplot(coef_df, aes(x = reorder(gsub('_',' ',gsub('_diff','',variable)), coefficients),
+                    y = coefficients))+
+  geom_col(fill = yaz_cols[1])+
+  coord_flip()+
+  labs(title = 'Fig 10: LASSO Classification Coefficients',
+       x = element_blank(),
+       y = 'Coefficient')+
+  theme_yaz()
+ggsave('Fig 10-LASSO Classification Coefficients.pdf', width = 6, height = 6)
+lasso.pred = as.vector(predict(lasso.fit, type = 'response', s = cv.out$lambda.min, newx = test.m))
+```
+
+## Boosted Classification Tree
+The hyperparameter to tune here is tree depth. The first loop here tests a range of possible tree depth values with 1000 trees. The winner is the depth that minimizes root mean squared error.
+```{r}
+library(gbm)
+bt.rmse <- c()
+for(i in seq(1,15)){
+  temp.boost.fit <- gbm(outcome~., 
+                        data = class.train.scaled%>%select(-contains('_id')), 
+                        distribution = 'bernoulli',
+                        n.trees=1000,
+                        interaction.depth=i)
+  temp.pred <- predict(temp.boost.fit, newdata = class.test.scaled, n.trees=1000, type = 'response')
+  bt.rmse[i] <- sqrt(mean((class.test.scaled$outcome - temp.pred)^2))
+}
+
+boost.fit <- gbm(outcome~., 
+                 data = class.train.scaled%>%select(-contains('_id')), 
+                 distribution = 'gaussian',
+                 n.trees = 10000,
+                 interaction.depth = 4)
+boost.pred <- predict(boost.fit, newdata = class.test.scaled, n.trees=10000, type = 'response')
+
+```
+
+## Classification Random Forest
+```{r}
+rf.fit <- randomForest(outcome~., data = class.train.scaled%>%
+                         select(-contains('_id'))%>%
+                         mutate(outcome = as.factor(outcome)))
+rf.pred <- predict(rf.fit, newdata = class.test.scaled, type = 'prob')[,1]
+```
+
+## Evaluating Classification Models
+```{r}
+prediction.df <- data.frame(observed = test.scaled$outcome,
+                            lasso = lasso.pred,
+                            boosted_trees = boost.pred,
+                            random_forest = rf.pred)%>%
+  mutate(random_forest = 1 - random_forest)
+## Ridgeline plot 
+prediction.df%>%
+  mutate(observed = ifelse(observed == 1, 'Win','Loss'))%>%
+  melt(id.vars = 'observed')%>%
+  ggplot(aes(x = value, y = tools::toTitleCase(gsub('_',' ',variable)), fill = observed))+
+  geom_density_ridges(alpha = .7)+
+  scale_fill_manual(name = element_blank(), values = yaz_cols[c(3,1)])+
+  theme_yaz()+
+  labs(title = 'Fig 10: Distribution of Predicted Win Probabilities by Outcome',
+       y = element_blank(),
+       x = 'Probability of Winning')
+ggsave('Fig 10-Distribution of Predicted Win Probabilities by Outcome.pdf',
+       width = 7, height = 4)
+## Classification Percentage  
+prediction.df%>%
+  dplyr::mutate(observed = ifelse(observed == 1, 'Win','Loss'))%>%
+  melt(id.vars = 'observed')%>%
+  # filter(value > .6 | value < .4)%>%
+  dplyr::mutate(value = round(value),
+         variable = as.character(variable))%>%
+  dplyr::group_by(observed, variable)%>%
+  dplyr::summarise(percent_winning = mean(value))%>%
+  ggplot(aes(x = tools::toTitleCase(gsub('_',' ',variable)), y = percent_winning*100, fill = observed))+
+  geom_col(legend = F)+
+  facet_wrap(~observed)+
+  scale_fill_manual(name = element_blank(), values = yaz_cols[c(3,1)])+
+  theme_yaz()+
+  labs(title = 'Fig 11: Percent Predicted as Wins by Observed Outcome',
+       y = 'Percent Predicted as Wins',
+       x = element_blank(),
+       caption = 'Source | sports-reference.com\nChart | Josh Yazman (@jyazman2012)')+
+  theme(legend.position = 'none',
+        axis.line = element_line())
+ggsave('Fig 11-Percent Predicted as Wins by Observed Outcome.pdf',
+       width = 7, height = 4)
+```
+
+# The See-Saw
+```{r}
+ss.train <- train.scaled%>%
+  bind_cols(data.frame(win_prob = predict(rf.fit, newdata = class.train.scaled, type = 'prob')[,1]))%>%
+  mutate(win_prob = 1 - win_prob)
+ss.test <- test.scaled%>%bind_cols(win_prob = rf.pred)%>%
+  mutate(win_prob = 1 - win_prob)
+rf.fit2 <- randomForest(point.spread~., data = ss.train%>%select(-contains('_id'),-outcome))
+rf.pred2 <- predict(rf.fit2, newdata = ss.test, type = 'response')
+rf.fit3 <- randomForest(point.spread~., data = ss.train%>%
+                          select(-contains('_id'),-outcome)%>%
+                          )
+cor(ss.test$point.spread,rf.pred2)^2
+```
+
