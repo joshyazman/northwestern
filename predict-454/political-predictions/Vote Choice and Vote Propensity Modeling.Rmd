@@ -1,0 +1,288 @@
+---
+title: "Vote Choice and Vote Propensity Modeling"
+output: html_notebook
+---
+
+Political campaigns often consider voter mobilization in terms of a two dimensional scale: vote propensity and candidate support. Determining the most effective targets for outreach can save time and money invested in reaching out to people who won't vote in general or, worse, turning out opposition voters. This paper uses the cumulative CCES file from 2006-2016, a decade's worth of pre-eleciton survey data, to classify individual level likelihood of voting and likelihood of supporting one party's candidate over another in federal or statewide elections. 
+
+The end goal is to develop a model that is generalizeable from year to year, but I'd settle for really good models that work within years and then add explanations for how they differ and why thereafter.
+
+# Clean and standardize CCES data
+Need to set up dummy variables for all categories and connect values to county-level data...
+
+```{r}
+library(tidyverse)
+library(yaztheme)
+library(mice)
+library(gbm)
+library(ranger)
+library(reshape2)
+library(glmnet)
+
+cces_raw <- read_delim('CCES16_Common_OUTPUT_Feb2018_VV.tab', delim = '\t')%>%
+  mutate(rep_gender = ifelse(CurrentHouseGender == 'M',1,0),
+         rep_party = ifelse(CurrentHouseParty == 'Democratic', 1, 0),
+         rep_opposed = ifelse(!is.na(HouseCand1Name) & !is.na(HouseCand2Name), 1, 0),
+         rep_incumb_running = ifelse(HouseCand1Incumbent == 1 | HouseCand2Incumbent == 1, 1, 0),
+         sen_sen_gender = ifelse(CurrentSen1Gender == 'M', 1, 0),
+         sen_sen_party = ifelse(CurrentSen1Party == 'Democratic', 1, 0),
+         sen_opposed = ifelse(!is.na(SenCand1Name) & !is.na(SenCand2Name), 1, 0),
+         sen_incumb_running = ifelse(SenCand1Incumbent == 1 | SenCand2Incumbent == 1, 1, 0),
+         jun_sen_gender = ifelse(CurrentSen2Gender == 'M', 1, 0),
+         jun_sen_party = ifelse(CurrentSen2Party == 'Democratic', 1, 0),
+         gov_party = ifelse(CurrentGovParty == 'Democratic', 1, 0),
+         gov_opposed = ifelse(!is.na(GovCand1Name) & !is.na(GovCand2Name), 1, 0),
+         gov_incumb_running = ifelse(GovCand1Incumbent == 1 | GovCand2Incumbent == 1, 1, 0),
+         rv = ifelse(votereg == 1, 1, 0), # 1 means registered
+         gender = ifelse(gender == 1, 1, 0), # 1 = M, 0 = Non-Male
+         age = 2016 - birthyr,
+         college = ifelse(educ %in% c(5,6), 1, 0), # 1 = college grad
+         edloan = ifelse(edloan == 1, 1, 0), # 1 = student loans present
+         white = ifelse(race == 1, 1, 0),
+         non_white = ifelse(white == 1, 0, 1),
+         unemployed = ifelse(employ %in% c(3, 4), 1, 0),
+         home_internet = ifelse(internethome %in% c(1,2), 1, 0),
+         married = ifelse(marstat == 1, 1, 0),
+         democrat = ifelse(pid3 == 1, 1, 0),
+         church = ifelse(pew_churatd %in% seq(1,3), 1, 0), # flags regular church attendance
+         home_owner = ifelse(ownhome == 1, 1, 0),
+         home_rent = ifelse(ownhome == 2, 1, 0),
+         unionhh = ifelse(unionhh == 1, 1, 0),
+         investor = ifelse(investor == 1, 1, 0),
+         health_insurance = ifelse(healthins_6 == 1, 0, 1),
+         cl_democrat = ifelse(CL_partyaffiliation == 'DEM', 1, 0),
+         cl_primary_voter = ifelse(!is.na(CL_E2016PPVM), 1, 0),
+         cl_dem_primary = ifelse(CL_E2016PPEP == 'DEM', 1, 0),
+         validated_voter = ifelse(!is.na(CL_E2016GVM), 1, 0),
+         id = row_number())%>%
+  select(id, commonweight_vv, democrat, rep_gender, rep_party, rep_opposed, rep_incumb_running,
+         sen_sen_gender, sen_sen_party, jun_sen_gender, jun_sen_party, sen_opposed,
+         sen_incumb_running, gov_party, gov_opposed, gov_incumb_running, n_kids = child18num,
+         years_in_loc = citylength_1, rv, gender, age, college, edloan, white, non_white,
+         unemployed, home_internet, married, church, home_owner, home_rent, unionhh, investor,
+         health_insurance, cl_democrat, cl_primary_voter, cl_dem_primary, validated_voter)
+
+temp.mice <- mice(cces_raw, seed = 34134)
+cces <- complete(temp.mice)
+cces <- read_csv('imputed_cces.csv')#%>%select(-lgbt)%>%mutate(id = row_number())
+train <- sample_frac(cces, size = .9, weight = commonweight_vv)
+test <- cces%>%filter(!id %in% train$id)
+```
+
+# Exploratory Analysis
+```{r}
+correlations_df <- cor(cces)[,c('democrat','validated_voter')]%>%
+  data.frame()%>%
+  bind_cols(data.frame(var = as.character(rownames(cor(cces)))))%>%
+  filter(!var %in% c('commonweight_vv','id','validated_voter'))%>%
+  melt(id.vars = 'var')%>%
+  filter(value != 1)%>%
+  mutate(variable = ifelse(variable == 'democrat','Party ID','Turnout'))
+
+ggplot(correlations_df, aes(x = var, y = value))+
+  geom_col(fill = yaz_cols[1])+
+  coord_flip()+
+  facet_wrap(~variable)+
+  labs(title = 'Fig 1: Initial Correlations',
+       x = element_blank(),
+       y = 'Correlation')+
+  theme_yaz()
+
+ggsave('Fig 1 - Initial Correlations.png', height = 5, width = 7)
+```
+
+# Gradient boosted tree models
+```{r}
+gbm.pid.16.fit <- gbm(democrat~.-commonweight_vv, data = train%>%select(-validated_voter, -id), 
+                      distribution = 'bernoulli', n.trees = 5000, interaction.depth = 5, 
+                      weights = commonweight_vv)
+gbm.pid.16.pred <- predict(object = gbm.pid.16.fit, newdata = test, 
+                           type = 'response', n.trees = 5000)
+
+gbm.vot.16.fit <- gbm(validated_voter~.-commonweight_vv, train%>%select(-democrat, -id), 
+                      distribution = 'bernoulli', n.trees = 5000, interaction.depth = 5, 
+                      weights = commonweight_vv)
+gbm.vot.16.pred <- predict(object = gbm.vot.16.fit, newdata = test, 
+                           type = 'response', n.trees = 5000)
+```
+
+Use relative influence to explain each model
+```{r}
+pid.sum <- summary(gbm.pid.16.fit)
+vot.sum <- summary(gbm.vot.16.fit)
+summaries <- bind_rows(data.frame(relative_influence = pid.sum$rel.inf,
+             variable = pid.sum$var)%>%
+    mutate(model = 'Partisanship'),
+  data.frame(relative_influence = vot.sum$rel.inf,
+             variable = vot.sum$var)%>%
+    mutate(model = 'Vote Propensity'))%>%
+  ggplot(aes(x = reorder(variable, relative_influence), y = relative_influence))+
+  geom_col(fill = yaz_cols[1])+
+  coord_flip()+
+  labs(title = 'Fig 2: Relative Influence of Model Variables',
+       x = element_blank(),
+       y = 'Relative Influence')+
+    facet_wrap(~model)+
+  theme_yaz()
+ggsave('Fig 2 - Relative Influence of Model Variables.png', height = 5, width = 7)
+```
+
+# Random Forest
+```{r}
+rf.pid.fit <- ranger(
+  formula = democrat~.-commonweight_vv, 
+  data = train%>%select(-validated_voter, -id)%>%mutate(democrat = as.factor(democrat)),
+  case.weights = train$commonweight_vv, importance = 'permutation', probability=TRUE, keep.inbag=TRUE)
+
+rf.pid.pred <- predict(object = rf.pid.fit, data = test, type= 'se')$predictions[,2]
+
+rf.vot.fit <- ranger(
+  formula = validated_voter~.-commonweight_vv, 
+  data = train%>%select(-democrat, -id)%>%mutate(validated_voter = as.factor(validated_voter)),
+  case.weights = train$commonweight_vv, importance = 'permutation', probability=TRUE, keep.inbag=TRUE)
+
+rf.vot.pred <- predict(object = rf.vot.fit, data = test, type= 'se')$predictions[,2]
+
+data.frame(weight = c(as.vector(importance(rf.pid.fit)), as.vector(importance(rf.vot.fit))),
+           variable = c(names(importance(rf.pid.fit)), names(importance(rf.vot.fit))),
+           model = c(rep('Partisanship',34),rep('Vote Propensity',34)))%>%
+  ggplot(aes(x = reorder(variable, weight), y = weight))+
+  facet_wrap(~model)+
+  geom_col(fill = yaz_cols[1])+
+  labs(title = 'Fig 3: Relative Influence of Model Variables', 
+       x = element_blank(),
+       y = 'Relative Influence')+
+  coord_flip()+
+  theme_yaz()
+ggsave('Fig 3 - Relative Influence of Model Variables.png', height = 5, width = 7)
+```
+
+# LASSO Logistic Regression
+Party ID code
+```{r}
+pid.M <- model.matrix(democrat~.-commonweight_vv, data = train%>%select(-validated_voter, -id))
+pid.y <- train$democrat
+grid=10^seq(10,-2, length =100)
+lasso.fit.test <- glmnet(pid.M,pid.y, alpha = 1, lambda = grid)
+# test for optimal lambda value
+set.seed(1)
+pid.cv.out=cv.glmnet(pid.M,pid.y,alpha=1)
+pid.cv_df <- data.frame(lambda = cv.out$lambda, high = cv.out$cvup, low = cv.out$cvlo)
+pid.lasso.fit<-glmnet(pid.M, train$democrat, alpha = 1, lambda = pid.cv.out$lambda.min)
+pid.test.M <- model.matrix(democrat~.-commonweight_vv, data = test%>%select(-validated_voter, -id))
+pid.coefficients <- predict(pid.lasso.fit, type = 'coefficient', s = pid.cv.out$lambda.min, newx = pid.test.M)
+pid.coef_df <- data.frame(coef = pid.coefficients[,1],
+                      variable = row.names(pid.coefficients))%>%
+  mutate(model = 'Partisanship')
+pid.lasso.pred = as.vector(predict(pid.lasso.fit, type = 'response', s = pid.cv.out$lambda.min, newx = pid.test.M))
+```
+
+Vote prop code
+```{r}
+vot.M <- model.matrix(validated_voter~.-commonweight_vv, data = train%>%select(-democrat, -id))
+vot.y <- train$validated_voter
+grid=10^seq(10,-2, length =100)
+lasso.fit.test <- glmnet(vot.M,vot.y, 
+                         alpha = 1, 
+                         lambda = grid, 
+                         weights = train$commonweight_vv)
+# test for optimal lambda value
+set.seed(1)
+vot.cv.out=cv.glmnet(vot.M,vot.y,alpha=1)
+vot.cv_df <- data.frame(lambda = cv.out$lambda, high = cv.out$cvup, low = cv.out$cvlo)
+vot.lasso.fit<-glmnet(vot.M, train$validated_voter, 
+                      alpha = 1, 
+                      lambda = vot.cv.out$lambda.min,
+                      weights = train$commonweight_vv)
+vot.test.M <- model.matrix(validated_voter~.-commonweight_vv, data = test%>%select(-democrat, -id))
+vot.coefficients <- predict(vot.lasso.fit, type = 'coefficient', s = vot.cv.out$lambda.min, newx = vot.test.M)
+vot.coef_df <- data.frame(coef = vot.coefficients[,1],
+                      variable = row.names(vot.coefficients))%>%
+  mutate(model = 'Vote Propensity')
+vot.lasso.pred = as.vector(predict(vot.lasso.fit, 
+                                   type = 'response', 
+                                   s = vot.cv.out$lambda.min, 
+                                   newx = vot.test.M))
+```
+
+Explanation of variable coefficients
+```{r}
+
+ggplot(bind_rows(pid.coef_df, vot.coef_df), 
+       aes(x = reorder(variable, coef),y = coef))+
+  geom_col(fill = yaz_cols[1])+
+  facet_wrap(~model)+
+  coord_flip()+
+  labs(title = 'Fig 4: LASSO Coefficients',
+       x = element_blank(),
+       y = 'Coefficient')+
+  theme_yaz()
+ggsave('Fig 4- LASSO Coefficients.png', width = 7, height = 5)
+
+```
+
+# Evaluate those models
+Models are evaluated on classification accuracy. In addition to the three models tested, several ensemble models are included 
+  * mean gbm and rf
+  * mean gbm and lasso
+  * mean rf and lasso
+  * mean all
+```{r}
+test_df <- test%>%
+  bind_cols(data.frame(boost.pid = gbm.pid.16.pred,
+                       boost.vot = gbm.vot.16.pred,
+                       rf.pid = as.numeric(rf.pid.pred),
+                       rf.vot = as.numeric(rf.vot.pred),
+                       lasso.pid = pid.lasso.pred,
+                       lasso.vot = vot.lasso.pred))%>%
+  select(democrat, validated_voter, boost.pid, boost.vot, rf.pid,
+         rf.vot, lasso.pid, lasso.vot, commonweight_vv)%>%
+  mutate(ens_gbm_rf_pid = (boost.pid + rf.pid)/2,
+         ens_gbm_lasso_pid = (boost.pid + lasso.pid)/2,
+         ens_lasso_rf_pid = (lasso.pid + rf.pid)/2,
+         ens_all_pid = (boost.pid + rf.pid + lasso.pid)/3,
+         ens_gbm_rf_vot = (boost.vot + rf.vot)/2,
+         ens_gbm_lasso_vot = (boost.vot + lasso.vot)/2,
+         ens_lasso_rf_vot = (lasso.vot + rf.vot)/2,
+         ens_all_vot = (boost.vot + rf.vot + lasso.vot)/3)%>%
+  melt(id.vars = c('democrat','validated_voter', 'commonweight_vv'))%>%
+  mutate(
+    model = case_when(
+      grepl('ens_gbm_rf', variable) ~ 'Ens. Boost & RF',
+      grepl('ens_gbm_lasso', variable) ~ 'Ens. Boost & LASSO',
+      grepl('ens_lasso_rf', variable) ~ 'Ens. LASSO & RF',
+      grepl('ens_all', variable) ~ 'Ens. All Models',
+      grepl('boost', variable) ~ 'Boosted Classification Tree',
+      grepl('rf.', variable) ~ 'Random Forest',
+      grepl('lasso', variable) ~ 'LASSO Logistic Regression'
+    ),
+    rounded = round(value),
+    pid.abs.error = democrat - value,
+    vot.abs.error = validated_voter - value,
+    class.pid.error = ifelse(rounded == democrat, 1, 0),
+    class.vot.error = ifelse(rounded == validated_voter, 1, 0),
+    target = ifelse(grepl('pid',variable),'Partisanship','Vote Propensity'))
+
+pid.test <- test_df%>%
+  filter(target == 'Partisanship')%>%
+  group_by(model)%>%
+  summarise(class_acc = weighted.mean(class.pid.error,w = commonweight_vv))%>%
+  mutate(class_acc = round(class_acc*100,2),
+         target = 'Partisanship')
+vot.test <- test_df%>%
+  filter(target != 'Partisanship')%>%
+  group_by(model)%>%
+  summarise(class_acc = weighted.mean(class.vot.error,w = commonweight_vv))%>%
+  mutate(class_acc = round(class_acc*100,2),
+         target = 'Vote Propensity')
+
+ggplot(bind_rows(pid.test, vot.test), aes(x = model, y = class_acc))+
+  geom_col(fill = yaz_cols[1])+
+  facet_wrap(~target)+
+  labs(title = 'Fig 5: Model Accuracy',
+       x = element_blank(),
+       y = '(%) Correctly Classified')+
+  coord_flip()+
+  theme_yaz()
+ggsave('Figure 5 - Model Accuracy.png', height = 4, width = 6)
+```
