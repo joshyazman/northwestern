@@ -1,0 +1,222 @@
+---
+title: 'Meet the Press Scraper'
+output: html_notebook
+---
+
+This code scrapes and formats the transcripts of Meet the Press episodes
+
+First we need to download a few key packages
+```{r}
+library(rvest)
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(readr)
+```
+
+URLs are stored in yearly pages so we have to extract them into a list of urls. 
+```{r}
+hp_urls <- 'https://www.nbcnews.com/meet-the-press/meet-press-transcripts-n51976'
+
+tran_urls <- read_html(hp_urls)%>%
+  html_nodes('p a')%>%
+  html_attr('href')
+
+capture_text <- function(transcript_url){
+  tran_html <- read_html(transcript_url)
+  show_date <- tran_html%>%
+    html_nodes('div h1')%>%
+    html_text()
+  show_text <- tran_html%>%
+    html_nodes('div p')%>%
+    html_text()%>%
+    trimws()%>%
+    .[4:length(.)]
+  speaker <- ifelse(grepl(':',show_text),
+                    unlist(lapply(strsplit(show_text, ':', fixed = TRUE), '[', 1)),
+                    NA)
+  show_df <- data.frame(show_text, speaker)%>%
+    do(zoo::na.locf(.))#%>%mutate(clean_text = str_replace(.$show_text, .$speaker, ''))
+  show_df$show_text <- gsub('[[:punct:] ]+',' ',show_df$show_text)
+  show_df$show_text <- str_replace(show_df$show_text, as.character(show_df$speaker),'')
+  show_df$show_text <- str_replace(show_df$show_text, ':','')
+  show_df$speaker <- gsub('[[:punct:] ]+',' ',show_df$speaker)
+  show_df <- show_df%>%
+    mutate(chars = nchar(trimws(show_text)))%>%
+    filter(chars>2)%>%
+    mutate(utterance = row_number(),
+           date = show_date)%>%
+    select(-chars)
+  return(
+    show_df
+         )
+}
+capture_text(tran_urls[5])  
+transcripts <- list()
+for(i in seq(1,length(tran_urls))){ #15,29,93,119,124,139,150 failed
+  transcripts[[i]] <- try(capture_text(tran_urls[i]))
+}
+clean_transcripts <- list()
+for(i in seq(2, length(transcripts))){
+  df <- transcripts[[i]]
+  if(!is.na(df) & is.data.frame(df)){
+    clean_transcripts[[i]] <- df
+  } else {
+    clean_transcripts[[i]] <- NA
+  }
+}
+transcripts_df <- bind_rows(clean_transcripts[!is.na(clean_transcripts)])%>%select(-utterance)
+unlist(lapply(strsplit(transcripts_df$date%>%trimws(), ':', fixed = T), '[', 1))
+write.csv(bind_rows(transcripts), 'newer_transcripts.csv')
+```
+
+```{r}
+begin <- 'http://www.nbcnews.com/id/'
+end <- '/ns/meet_the_press-resources/#.WnJ2aahKuUn'
+year_urls <- c('8987534','45753152','42784428','40871902','34643492',
+               '28452155','23017575','16456474','10558539','9439083')
+year_shows <- list()
+for(i in seq(1,length(year_urls))){
+  year_html <- read_html(paste0(begin,year_urls[i],end))
+  poss_urls <- year_html%>%
+    html_nodes('span a')
+  year_shows[[i]] <- poss_urls%>%
+    html_attr('href')%>%
+    .[grepl('nbcnews.com',.)]
+}
+show_urls <- unlist(year_shows)
+transcript_urls <- show_urls[grepl('transcript',show_urls)]
+good_html <- list()
+for(i in seq(1,length(transcript_urls))){
+  good_html[[i]] <- try(read_html(transcript_urls[i]))
+}
+transcript_urls[2]
+capture_text <- function(obj){
+  show_text <- obj%>%
+    html_nodes('div p')%>%
+    html_text()%>%
+    trimws()
+  return(show_text)
+}
+  
+capture_date <- function(obj, text_list){
+  show_date <- obj%>%
+    html_nodes('div abbr')%>%
+    html_text()
+  return(rep(show_date, length(text_list)))
+}
+show_df <- list()
+for(i in seq(1,length(good_html))){
+  if(length(good_html[[i]]) == 2){
+    show_df[[i]] <- data.frame(text = capture_text(good_html[[i]]),
+                               date = capture_date(good_html[[i]], 
+                                                   capture_text(good_html[[i]])))
+  } else {
+    print(length(good_html[[i]]))
+    show_df[[i]] <- NA
+  }
+}
+all_show_dfs <- bind_rows(show_df[!is.na(show_df)])
+```
+Next, we split off the speaker from the thing spoken. It's not the cleanest formating because the speaker and their text comes in a single string delimited by a colon. So after extracting speaker, we need to go through and run some diagnostic checks to clean up the list of guests.
+```{r}
+speaker <- ifelse(grepl(':',all_show_dfs$text),
+                    unlist(lapply(strsplit(all_show_dfs$text,
+                                           ':', fixed = TRUE), '[', 1)),NA)
+shows_speakers <- data.frame(all_show_dfs, data.frame(speaker))%>%
+  do(zoo::na.locf(.))%>%
+  select(show_text = text, speaker, date)
+
+shows_speakers%>%
+  mutate(first = ifelse(substr(speaker, 0,1)==toupper(substr(speaker,0,1)),1,0),
+         second = ifelse(substr(speaker, 1,2)==toupper(substr(speaker,1,2)),1,0),
+         third = ifelse(substr(speaker, 2,3)==toupper(substr(speaker,2,3)),1,0),
+         name_score = first+second+third)%>%
+  distinct(speaker,.keep_all = T)%>%
+  filter(name_score > 1)%>%
+  write.csv('speakers.csv', row.names = F)
+```
+
+Combine the two sets of transcripts
+```{r}
+# library(readr)
+full_df <- bind_rows(transcripts_df, shows_speakers)
+
+write.csv(full_df, 'all_mtp_transcripts.csv', row.names = F)
+full_df <- read_csv('all_mtp_transcripts.csv')
+```
+
+Standardize dates
+There are 3 distinct sets of dates in this dataset
+  * A: Meet the Press - February 4, 2018
+  * B: "\r\n            January 5: Janet Napolitano, Gene Sperling, Jim Cramer, Delos Cosgrove, John Noseworthy, Steve Schmidt, Donna Edwards, Judy Woodruff, Chuck Todd \r\n        "                                       
+    - Conveniently, the few of these that exist are all Feb 2014
+  * C: "2/2/2014 12:04:49 PM ET"  
+```{r}
+library(anytime)
+all_dates <- unique(full_df$date)
+save(all_dates, file = 'all_dates.RData')
+load('all_dates.RData')
+# Type A dates
+date.a <- tolower(all_dates[1:189])
+date.a.clean <- function(dt){
+  dt <- gsub('meet the press','',dt)
+  dt <- gsub('transcript','',dt)
+  dt <- gsub(' -','',dt)
+  dt <- gsub('january ','1/',dt)
+  dt <- gsub('february |feb. ','2/',dt)
+  dt <- gsub('march ','3/',dt)
+  dt <- gsub('april ','4/',dt)
+  dt <- gsub('may ','5/',dt)
+  dt <- gsub('june ','6/',dt)
+  dt <- gsub('july ','7/',dt)
+  dt <- gsub('august ','8/',dt)
+  dt <- gsub('september ','9/',dt)
+  dt <- gsub('october ','10/',dt)
+  dt <- gsub('november ','11/',dt)
+  dt <- gsub('december ','12/',dt)
+  dt <- gsub(', |-','/',dt)
+  dt <- gsub('- |: ','',dt)
+  dt <- gsub('/sept. ','9/',dt)
+  dt <- gsub(',','/',dt)
+  dt <- trimws(dt)
+  if(substr(dt, nchar(dt)-2,nchar(dt)) %in% c('/16','/17')){
+    dt <- paste0(substr(dt, 1, nchar(dt)-2), '20', substr(dt, nchar(dt)-1,nchar(dt)))
+  }
+  return(dt)
+}
+
+# Type B dates
+date.b <- all_dates[190:194]
+
+date.b.clean <- function(dt){
+  dt <- tolower(trimws(dt))
+  dt <- unlist(lapply(strsplit(dt,':', fixed = TRUE), '[', 1))
+  dt <- gsub('january ','1/',dt)
+  dt <- gsub('february |feb. ','2/',dt)
+  dt <- paste0(dt,'/2014')
+
+  return(dt)
+}
+
+# Type C dates
+date.c <- all_dates[195:length(all_dates)]
+date.c.cleaner <- function(dt){
+  dt <- strsplit(dt, ' ')[[1]][1]
+  return(dt)
+}
+# anytime::anydate(date.c)
+
+date.c.cleaner(date.c[1])
+clean_dates <- c(unlist(lapply(date.a, date.a.clean)),
+                 unlist(lapply(date.b, date.b.clean)),
+                 unlist(lapply(date.c, date.c.cleaner)))
+clean_date_df <- data.frame(all_dates, clean_dates)
+```
+
+```{r}
+full_df%>%
+  left_join(clean_date_df, by = c('date' = 'all_dates'))%>%
+  select(-date, date = clean_dates)
+```
+

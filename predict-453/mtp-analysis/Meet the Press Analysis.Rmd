@@ -1,0 +1,340 @@
+---
+title: "Meet the Press Analysis"
+output: html_notebook
+---
+
+Read in the data and convert to a document term matrix with stop-words and words used in fewer than 10 shows removed
+```{r}
+library(tidyverse)
+library(tidytext)
+library(textstem)
+library(stringr)
+library(stringi)
+all_raw <- read_csv('all_mtp_transcripts.csv')
+
+trump_era_shows <- all_raw%>%
+  filter(date %in% unique(all_raw$date)[1:146])
+
+# write.csv(data.frame(dates = unique(trump_era_shows$date)), file = 'date_clean.csv', row.names = FALSE)
+clean_dates<- read_csv('date_clean.csv')
+# write.csv(data.frame(speakers = unique(trump_era_shows$speaker)), file = 'speaker_clean.csv', row.names = FALSE)
+
+trump_era_shows <- trump_era_shows%>%
+  left_join(clean_dates, by = c('date' = 'dates'))%>%
+  mutate(date = as.Date(clean_date, format = '%m/%d/%Y'),
+         utterance_id = as.character(row_number()),
+         show_text = stri_trans_general(show_text, "latin-ascii"))%>%
+  select(-clean_date)
+
+all_words <- trump_era_shows%>%
+  unnest_tokens(word, show_text)%>%
+  mutate(word = lemmatize_strings(word))
+
+# Filter common stopwords and words that don't show up in more than 10 shows
+all_words_filtered <- all_words%>%
+  filter(!word %in% stop_words$word,
+         str_detect(word, "[a-z]"),
+         !word %in% c('didn','rep','sen','lt','gen'))%>%
+  group_by(word, date)%>%
+  filter(n() > 10)%>%
+  ungroup()%>%
+  group_by(utterance_id)%>%
+  mutate(word_count = n())%>%
+  ungroup()%>%
+  filter(word_count > 3)
+
+# how many unique words are left?
+# length(unique(all_words_filtered$word))
+# 887 unique words remaining
+
+all_words_dtm_df <- all_words_filtered%>%
+  group_by(word, utterance_id)%>%
+  summarise(n = n())
+
+all_shows_dtm <- cast_dtm(
+  data = all_words_dtm_df,
+  document = utterance_id,
+  term = word,
+  value = n
+  )
+```
+
+# Topic Modeling
+Use the ldatuning package to test a variety of potential LDA models for accuracy. It looks like the ideal model is around 25 topics
+```{r}
+library(ldatuning)
+
+results <- FindTopicsNumber(
+  all_shows_dtm,
+  topics = seq(from = 2, to = 50, by = 2),
+  metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010", "Deveaud2014"),
+  method = "Gibbs",
+  control = list(seed = 77),
+  mc.cores = 2L,
+  verbose = TRUE
+)
+FindTopicsNumber_plot(results)
+# write.csv(results, 'ldatuning_results.csv', row.names = F)
+```
+
+Build a model with 20 topics
+```{r}
+library(topicmodels)
+mtp.lda.fit <- LDA(x = all_shows_dtm, k = 30)
+```
+
+Identify the top words in each cluster and save the gamma and beta dfs
+```{r}
+mtp.gamma.30 <- tidy(mtp.lda.fit, 'gamma')
+mtp.beta.30 <- tidy(mtp.lda.fit, 'beta')
+write.csv(mtp.gamma.30, 'gamma.30.csv', row.names = FALSE)
+write.csv(mtp.beta.30, 'beta.30.csv', row.names = FALSE)
+mtp.beta <- read_csv('beta.30.csv')
+mtp.gamma <- read_csv('gamma.30.csv')
+```
+
+Analyze and classify topics.
+Pick out the top 10 topics by topic frequency
+```{r}
+mtp.gamma%>%
+  group_by(topic)%>%
+  top_n(20)%>%
+  ungroup()%>%
+  mutate(document = as.character(document))%>%
+  left_join(trump_era_shows%>%mutate(utterance_id = as.character(utterance_id)),
+            by = c('document'='utterance_id'))%>%
+  filter(topic %in% c(18, 29, 30))
+```
+
+```{r}
+ten_words_per_topic <- mtp.beta%>%
+  filter(!is.na(term), 
+         # removing a bunch of words that show up in the top 10 words for more than 1/3 of the topics
+         !term %in% c('trump','people','president','don','talk',
+                      'lot','republican','time','vote','campaign',
+                      'issue','clinton','democrat','american','donald',
+                      'party','win','question','house','hillary','country',
+                      'week','day','chuck','todd','doesn','senator',
+                      'governor','election','happen'))%>%
+  mutate(topic = case_when(
+    topic == 1 ~ 'Party Support',
+    topic == 2 ~ 'Race Relations',
+    topic == 3 ~ 'House Russia Investigation',
+    topic == 4 ~ 'Candidate Speculation',
+    topic == 5 ~ 'Poll Spinning',
+    topic == 6 ~ 'Congressional Politics',
+    topic == 7 ~ 'Middle East Policy',
+    topic == 8 ~ 'Russian Election Meddling',
+    topic == 9 ~ 'Republican Tax Bill',
+    topic == 10 ~ 'Fire and Fury',
+    topic == 11 ~ 'Trump Admin Press Relations',
+    topic == 12 ~ 'Obamacare Repeal Efforts',
+    topic == 13 ~ 'Iran Nuclear Deal',
+    topic == 14 ~ 'Syrian Civil War',
+    topic == 15 ~ 'NFL',
+    topic == 16 ~ 'Russian Election Meddling',
+    topic == 17 ~ 'Comey Firing',
+    topic == 18 ~ 'Failed Primary Candidates',
+    topic == 19 ~ 'Medicare & Medicaid',
+    topic == 20 ~ 'Republican Primary Delegates',
+    topic == 21 ~ 'Republican Super Tuesday',
+    topic == 22 ~ 'SCOTUS',
+    topic == 23 ~ 'Trump Budget',
+    topic == 24 ~ 'Foreign Policy',
+    topic == 25 ~ 'Terrorism Reaction',
+    topic == 26 ~ 'Democratic Primary',
+    topic == 27 ~ 'Alabama Senate Election',
+    topic == 28 ~ 'Culture Wars',
+    topic == 29 ~ 'Uncategorized',
+    topic == 30 ~ 'Uncategorized'
+  ))%>%
+  group_by(topic)%>%
+  top_n(10, wt = beta)%>%
+  ungroup()
+
+ten_words_per_topic%>%
+  count(term)%>%
+  arrange(desc(n))
+
+ggplot(ten_words_per_topic, aes(x = reorder(term, beta), y = beta))+
+  facet_wrap(~topic, scales = 'free', nrow = 7)+
+  geom_col(fill = yaz_cols[1])+
+  coord_flip()+
+  labs(title = 'Figure 1: Topic Definitions and Key Words: Meet the Press Episodes between January 2015 and January 2018',
+       subtitle = 'Results of term clustering using LDA. Chart labels are a manual interpretation of each set of terms and several of the statements that belong to a cluster.',
+       x = element_blank(),
+       y = 'Beta (Term Importance to Topic)')+
+  theme_yaz()
+
+ggsave('topics.png', height = 16, width = 12)
+```
+
+## Topics and their meanings
+### 1. Party Support
+Since both parties nominated historically unpopular candidates for President (and the Republicans nominated a credibly accused child molester for Senate) there is a cluster of expressions around affirming support for one's party. Example: "You know obviously Donald Trump was not my first choice or my 17th choice to put it mildly However he is the nominee the presumptive nominee I don't see a third party challenger come along I would rather as Paul Ryan has said rather Mr Trump simply change some of his positions and modify what he has said" - Jeff Flake
+
+### 2. Race Relations
+A major issue in the 2016 election and the first year of the Trump administration was race relations. Multiple stories, like Sheriff Joe Arpaio's criminal case and subsequent pardon, Black Lives Matter protest, and racial undertones in Donald Trump's campaign messaging kept this story relevant. Example: "And when I think about how the president goes and pardons Sheriff Arpaio and then is kind of saying that Sheriff Clarke s book is something that you should buy what you re seeing the strain that you re seeing there is the fact that he endorses racial discrimination He s someone who looks at a sheriff who almost bankrupt his own county trying to pursue people who were Latino and racially profiling them who didn't who wasn t investigating sex crimes because he wanted to go after people who were sometimes American citizens and says That s what I want to get behind That s what really excites me" - Yamiche Alcindor
+### 3. House Russia Investigation
+There are three major investigations into Russia's meddling in the 2016 election. In the House, the investigation was primarily a messaging platform for both parties. Example: "Because ultimately when they did interview the witnesses they didn t corroborate the Republican conspiracy theories The reason the answer to your question Chuck about why we haven t brought in a defense secretary as they said they would why we haven t brought in a C I A director why we haven t brought in any of these witnesses for a hearing is because they re not running for president When Richard Hanna" - Adam Schiff
+### 4. Candidate Speculation
+These segments focused on whether or not particular candidates would run for President. Example: "I want to bring before we leave the Democrats here I want to bring it to Joe Biden Here's what Peter Hart had an interesting and Joe Biden s going to make a decision soon we think Peter Hart had an interesting way to describe a potential Biden candidacy" - Peter Hart
+### 5. Poll Spinning
+Segments discussing public opinion polling. Example: "It s interesting the way CNN spun that poll because you know what that poll showed It showed between their last poll and this current poll we gained 12 points on Hillary Clinton She dropped eight We went up by four That is the message of the poll Another poll came out Rasmussen also showing us closing the gap In New Hampshire some of the recent polls have us ahead and in Iowa we re close to catching up to her So I think what the polls are showing is that the American people are responding to our message" - Bernie Sanders
+### 6. Congressional Politics
+Discussions of various committee processes in Congress including intelligene committee proceedings about Russia and the 2016 election as well as ethics violations. This cluster also included several stories about the 2017 Virginia elections, which featured a great deal of messaging around foreign threats to the homeland. Example: "Because there is a question as to whether the Ethics Committee can get testimony if you have signed a nondisclosure agreement We re saying we think the Ethics Committee can but if you don t agree we ll pass a law that says the Ethics Committee can a resolution in Congress that the Ethics Committee can" - Nancy Pelosi
+### 7. Middle East Policy
+Primary candidates spent a decent amount of time relitigating the Iraq war due to Hillary Clinton's Senate vote in favor of invasion and Donald Trump's erronious claim that he never supported the invasion. Example: "No I was in the private sector so I didn t think about it too much But certainly the war in Iraq was a disaster No not to be impeached but the war in Iraq was a disa it was a mistake He just made a mistake We went into Iraq we lost thousands of lives we lost trillions of dollars 2 trillion" - Donald Tump
+### 8. Russian Election Meddling
+General discussion of Russian election interference. Example: "Well first of all I thought that interview was breathtaking There s really no doubt that the Russians hacked our institutions So you don t have the director of national intelligence making a public statement the way he did in October without there being a broad consensus of all the intelligence agencies And frankly I don t know a Democrat or Republican who has heard the intelligence that would quarrel with those conclusions So I think that s fact one the Russians definitely this was not China this wasn t some 400 pound guy in New Jersey or anyone else this was the Russians" - Adam Schiff
+### 9. Republican Tax Bill
+Discussions about the Republican tax cut bill passed in 2017. Example: "The American people are tired of a tax code that 100 years ago was a few hundred pages long today is 75 000 pages long They re ready for reform They re ready for tax code simplification My tax reform plan would get rid of the marriage tax penalty which is a concern to many people It gets rid of the parent tax penalty And it would provide a new child tax credit to help get rid of that parent tax penalty" - Steve Schmidt
+### 10. Fire and Fury
+Discussions of Michael Wolff's tell-all book about the Trump administration. Example: "Well Michael has been a friend of mine over the years I don t know if we re friends anymore frankly But Michael has been a friend of mine I would love to have Michael Bloomberg run I would love that competition I think I d do very well against it I would love to see Michael Bloomberg run" - DJT
+### 11. Trump Admin Press Relations
+A cluster of conversations about how the press treats Trump and vice versa, mainly centering on the Trump administration's pushback against fact checking. Example: "answer the question of why the president asked the White House press secretary to come out in front of the podium for the first time and utter a falsehood Why did he do that It undermines the credibility of the entire White House press office"	- Chuck Todd
+### 12. Obamacare Repeal Efforts
+Discussions of the many attempts at repealing the Affordable Care Act. Example: "I've always been a yes for repeal But the bill unfortunately the Graham Cassidy bill basically keeps most of the Obamacare spending almost all of the spending and just re shuffles it and block grants it to the states So I don't think block granting Obamacare makes. it doesn't make it go away It just means you're keeping all the money we've been spending through Obamacare most of it re shuffling it taking the money from Democrat states and giving it to Republican states I think what it sets up is a perpetual food fight over the formula What happens when the Democrats win They're going to try to claw back that money from Republican states and give it to Democrat states This is a bad idea It's not repeal However all that being said if they narrow the focus to things we all agree on expanding health savings accounts giving governors more freedom through waivers slowing down the rate of growth of an outrageous or out of control entitlement spending sure I'd be for that But uh I'm just not for this block granting concept because to me that is an affirmative vote that I've agreed to keep Obamacare" - Rand Paul
+### 13. Iran Nuclear Deal
+Discussions of the Iran Nuclear Deal, which re-appears as an issue periodically as the Trump administration toys with whether or not to abide by the deal's terms. Example: "We want a solid deal that denies Iran the ability to make nuclear weapons a deal that is verifiable a deal that cuts all avenues to a nuclear weapon for Iran a solid deal And so we re waiting to see the results of the negotiations before we assess the deal"	- Adel Al Jubeir
+### 14. Syrian Civil War
+Coverage of the ongoing civil war in Syria. Example: "He already has that authority You ve got some good people on this program I differ with them in this regard I think the president has authorization to use force Assad signed the chemical weapons treaty ban There s an agreement with him not to use chemical weapons" - Lindsay Graham
+### 15. NFL
+A broad ranging topic that encompasses the NFL player protests against police brutality, concussions, and broader racial issues like voter ID laws. Example: "Good Sunday morning There are two big stories we re watching this morning The first is President Trump s attack on NFL players who refuse to stand for the national anthem It began Friday night with a speech in Alabama with Mr Trump saying he wishes an NFL owner would say the following" - Chuck Todd
+### 16. Russia Meddling Politics
+Discussions of the political implications of the Russian Election hacking for Trump and Republicans. Example: "Well look you start with you use the phrase Chuck cover up Let's be realistic here You've had lawyers on your broadcast and NBC's had lawyers on their network and everybody's coming to the same conclusion regarding the legality there's nothing illegal about that meeting So that's number one It's not covering up That's a big word to use But there was nothing illegal to cover up With regard to how the information came out as I said that was information that was controlled not by my client not by the president it was controlled by Donald Trump Jr and they made a decision on how to release that out That is a decision they made The president was not involved in that decision I was not involved in that decision Our lawyers were not involved in that decision" - Jay Sekulow
+### 17. Comey Firing
+Talk about the firing of James Comey. Example: "Well I think we need to have Comey come before the Judiciary Committee and clear the air Did the president ever say anything to the director of the FBI that would be construed as trying to impede the investigation The president called me about the firing and he referenced the Comey testimony last week in the Judiciary Committee about how bad it was and that's all I know But I think it's time to call the FBI director before the country and explain what happened at that dinner and if there are any tapes they have to be turned over You can't be cute about tapes If there are any tapes of this conversation they need to be turned over I doubt if there are But we need to clear the air" - Lindsay Graham
+### 18. Failed Primary Candidates
+### 19. Medicare & Medicaid
+Typically pegged to discussions of the ACA repeal efforts, these conversations focus mostly on Medicare/Medicaid. Example: "Well I think the goal here should be to include people in the system who aren't in it yet to give people more choices to create more competition I don't talk to anybody who doesn't believe there has to be a way that's better than the current system to be sure that people that have pre existing conditions continue to be covered and for the states to have more options in Medicaid is a good thing not a bad thing Every state is different This is a huge budget issue in every state People need things like a medical home if that's what the state thinks they can put together so you have a place to go Coverage is different than access And both in the insurance market where a lot of people have coverage but nobody has a place to go because their deductible's so high or in Medicaid where people are covered but doctors increasingly don't want to take Medicaid patients Those are the kind of problems we ought to be solving" - Roy Blunt
+### 20. Republican Primary Delegates
+Specific discussion of the Republican Primary delegate selection process where some never Trump delegates tried to derail his nomination after the primary voting had pretty much wrapped up. Example: "So we have free agent delegates we have zombie delegates I want to talk about the free agent delegates first because we have Donald Trump this morning already angry about this Louisiana he wins the primary big he should get a lion s share of the delegates The Cruz campaign claims they actually are going to have more delegates out of Louisiana a state they lost than Trump How did they do it Explain" - Chuck Todd
+### 21. Republican Super Tuesday
+Discussions of important states in teh Republican Primary (like Ohio/Texas and Super Tuesday). Example: "In Illinois Trump s lead is smaller but it s significant over Cruz and Kasich He s got a nine point lead over Cruz but Kasich a close third there to Cruz But in Ohio it is Governor John Kasich holding a slim six point lead over Donald Trump 39 33 Obviously a Kasich win there would keep him in the race and complicate Trump s efforts to win a majority of the delegates before the convention" - Chuck Todd
+### 22. SCOTUS
+Discussions of the Gorsuch confirmation battle and Merrick Garland's held-up nomination. Example: "Well let s look at the history Our Republican colleagues had been holding back on just about all of so many lower court judges including very important D C circuit I went to Lamar Alexander one of my dear friends in the Senate and I said Look if you keep holding back on scores and scores of judges my side s going to want to change the rules Go to Mitch and tell him at least let us have some votes on a few of these many of whom have gotten bipartisan support The answer was no And we changed the rules But the one thing that stands out here Chuck is we did not change it for Supreme Court for one very important reason And that is on the most important of decisions 60 votes is called for That s how you get a mainstream justice Mitch calls it a filibuster we call it the 60 vote standards Most Americans believe in the 60 vote standard" - Chuck Schumer
+### 23. Trump Budget
+Interviews about the Trump administration's budget priorities. The most important word is "Obama" which might indicate the degree to which the budget was based on rolling back the previous administration's priorities. Example: "And so what we did with this budget was go through and find out where we thought the infrastructure money was not being spent as efficiently as it possibly could and said Okay let s take it out of the discretionary budget with the intention of putting it back into the infrastructure bill and that s exactly what we did We think it s a better allocation a better use of Americans resources" - Mick Mulvaney
+### 24. Foreign Policy
+Discussions of the major foreign policy issues during the Trump administration. Example: "I want to start with North Korea President Trump just tweeted this this morning "Why would I call China a currency manipulator when they are working with us on the North Korean problem We will see what happens" Why does China's currency policy have anything to do with North Korea Should it have anything to do with North Korea" - Chuck Todd
+### 25. Terrorism Reaction
+Analysis of Trump's reaction to the terror attacks in Paris and London where ISIS inspired suicide attackers drove trucks into crowds. Example: "He has I mean never before in our history have we seen a president of the United States confirming something ahead of his own national security council Forwarding things that are printed on Drudge about a terror attack and one of our dearest alliances in London So number one Number two he's politicizing it by attacking the Mayor of London The Mayor of London saying there is no reason for alarm He's trying to calm his citizens and the president is essentially making fun of that And then he's politicizing it by bringing up the travel ban Forget the legal argument of what it does to the Supreme Court by saying that it is a ban even though they are arguing that it's not a ban politicising the moment of a terror attack has never been done before by the president of the United States" - Stephanie Cutter
+### 26. 2016 Democratic Primary
+Coverage of the 2016 Democratic Primary between Bernie Sanders and Hillary Clinton. Example: "However Helene as Jeff actually brought up in the last segment if Iowa and New Hampshire both go Sanders and they re sending a message this idea and I have heard this from Democrats Oh what happens in Iowa and New Hampshire stays in Iowa New Hampshire what Why are we so sure of that That wasn t the case for Barack Obama" - Chuck Todd
+### 27. Alabama Senate Election
+Example: "Well the President felt his responsibility to the party that he is the standard bearer of the party it<U+0092>s who the party chose But he also recognized that Roy Moore was a deeply flawed candidate And the day after the election something that has not frankly received as much coverage is the president called Doug Jones He congratulated him on a well run campaign and he said I look forward to working with you when you get here We hope that frankly Doug Jones will help us change the climate here in Washington where we can actually begin to work in a bipartisan manner The question will be will Doug Jones actually work to represent the people of Alabama or will he side with Elizabeth Warren and Chuck Schumer on their agenda" - Marc Short
+### 28. Updated Culture Wars
+This cluster covers sexual assault content (like the Al Franken scandal and Roy Moore) as well as the gun safety debate. Example: "Democrats always default to sort of self immolation It s what they do Democrats torture themselves because it s part of being a Democrat But I think uh uh the question of Franken and Trump I think is important because these two things took place one year apart One year before that USO uh event at which Al Franken admits now and at least has attempted to repent of what he did in 2006 one year before that Donald Trump was saying Because I am a celebrity which Franken was I can forcibly kiss women and I can forcibly grope them The identical behavior that he was on Twitter attacking Franken for again admitting and apologizing and repenting for he was boasting one year earlier that he could do that because he was a star" - Joy Reid
+### 29. Uncategorized
+### 30. Uncategorized
+
+# Connect back to Partisanship
+```{r}
+coded_guests <- read_csv('guests_cleaned.csv')
+topics_assigned <- mtp.gamma%>%
+  mutate(topic = case_when(
+    topic == 1 ~ 'Party Support',
+    topic == 2 ~ 'Race Relations',
+    topic == 3 ~ 'House Russia Investigation',
+    topic == 4 ~ 'Candidate Speculation',
+    topic == 5 ~ 'Poll Spinning',
+    topic == 6 ~ 'Congressional Politics',
+    topic == 7 ~ 'Middle East Policy',
+    topic == 8 ~ 'Russian Election Meddling',
+    topic == 9 ~ 'Republican Tax Bill',
+    topic == 10 ~ 'Fire and Fury',
+    topic == 11 ~ 'Trump Admin Press Relations',
+    topic == 12 ~ 'Obamacare Repeal Efforts',
+    topic == 13 ~ 'Iran Nuclear Deal',
+    topic == 14 ~ 'Syrian Civil War',
+    topic == 15 ~ 'NFL',
+    topic == 16 ~ 'Russian Election Meddling',
+    topic == 17 ~ 'Comey Firing',
+    topic == 18 ~ 'Failed Primary Candidates',
+    topic == 19 ~ 'Medicare & Medicaid',
+    topic == 20 ~ 'Republican Primary Delegates',
+    topic == 21 ~ 'Republican Super Tuesday',
+    topic == 22 ~ 'SCOTUS',
+    topic == 23 ~ 'Trump Budget',
+    topic == 24 ~ 'Foreign Policy',
+    topic == 25 ~ 'Terrorism Reaction',
+    topic == 26 ~ 'Democratic Primary',
+    topic == 27 ~ 'Alabama Senate Election',
+    topic == 28 ~ 'Culture Wars',
+    topic == 29 ~ 'Uncategorized',
+    topic == 30 ~ 'Uncategorized'
+  ))
+full <- all_words_filtered%>%
+  inner_join(coded_guests, by = c('speaker' = 'speakers'))%>%
+  group_by(clean_name, utterance_id)%>%
+  ungroup()%>%
+  filter(party %in% c('dem','rep','na'))%>%
+  select(-word_count, -speaker)%>%
+  left_join(topics_assigned%>%mutate(document = as.character(document)),
+             by = c('utterance_id' = 'document'))%>%
+  group_by(utterance_id)%>%
+  top_n(1, wt = gamma)%>%
+  ungroup()
+
+```
+
+Partisan TF-IDF
+```{r}
+coef_df <- list()
+exists_coefs <- c()
+for(i in seq(1,length(unique(full$topic)))){
+  party_tfidf <- full%>%
+    filter(topic == unique(full$topic)[i])%>%
+    group_by(word, party)%>%
+    summarise(n = n())%>%
+    bind_tf_idf(word, party, n)%>%
+    select(-tf_idf, -idf, -tf)%>%
+    spread(party, n)%>%
+    filter(!is.na(na) & (!is.na(dem) | !is.na(rep)))
+  mod.temp <- summary(glm(party_tfidf$na~party_tfidf$dem + party_tfidf$rep, family = 'poisson'))$coefficients
+  exists.mod <- summary(glm(party_tfidf$dem ~ party_tfidf$rep, family = 'poisson'))$coefficients
+  coef_df[[i]] <- data.frame(
+    topic = rep(unique(full$topic)[i],2),
+    party = c('Democrat','Republican'),
+    journ_pe = c(mod.temp[2,1], mod.temp[3,1]),
+    journ_lo = c(mod.temp[2,1] - (mod.temp[2,2]*1.96), mod.temp[3,1] - (mod.temp[3,2]*1.96)),
+    journ_hi = c(mod.temp[2,1] + (mod.temp[2,2]*1.96), mod.temp[3,1] + (mod.temp[3,2]*1.96)),
+    frame_pe = c(exists.mod[2,1], mod.temp[2,1]),
+    frame_lo = c(exists.mod[2,1] - (mod.temp[2,2]*1.96), mod.temp[2,1] - (mod.temp[2,2]*1.96)),
+    frame_hi = c(exists.mod[2,1] + (mod.temp[2,2]*1.96), mod.temp[2,1] + (mod.temp[2,2]*1.96))
+  )
+}
+
+all_coefficients <- bind_rows(coef_df)%>%filter(topic != 'Uncategorized')
+ggplot(all_coefficients%>%distinct(topic, .keep_all = TRUE),
+       aes(x = topic, y = (exp(frame_pe)*100)-100))+
+  geom_errorbar(aes(ymin = (exp(frame_lo)*100)-100, ymax = (exp(frame_hi)*100)-100),
+                width = 0.5, alpha = .7, color = yaz_cols[4])+
+  geom_point(color = yaz_cols[4])+
+  labs(title = 'Figure 2: Existence of Framing by Topic',
+       x = element_blank(), 
+       y = '(%) Likelihood that Democrat Uses a Term Given Republican Use')+
+  coord_flip()+
+  scale_color_manual(values = yaz_cols[1:2], name = 'Party')+
+  theme_yaz()+
+  theme(panel.grid.major.y = element_line(color = 'grey80', linetype = 'dashed'),
+        axis.ticks = element_blank(),
+        axis.line = element_line())
+ggsave('Figure 2 - Existence of Framing by Topic.png', width = 6, height = 4)
+ggplot(all_coefficients,
+       aes(x = topic, y = (exp(journ_pe)*100)-100, color = party))+
+  geom_errorbar(aes(ymin = (exp(journ_lo)*100)-100, ymax = (exp(journ_hi)*100)-100),
+                width = 0.5, alpha = .7)+
+  geom_point()+
+  labs(title = 'Figure 3: Frame Influence Coefficients by Topic',
+       x = element_blank(), 
+       y = '(%) Likelihood that Journalist Use a Term Given Partisan Use')+
+  coord_flip()+
+  scale_color_manual(values = yaz_cols[1:2], name = 'Party')+
+  theme_yaz()+
+  theme(panel.grid.major.y = element_line(color = 'grey80', linetype = 'dashed'),
+        axis.ticks = element_blank(),
+        axis.line = element_line())
+ggsave('Figure 3 - Frame Influence Coefficients by Topic.png', width = 6, height = 4)
+```
