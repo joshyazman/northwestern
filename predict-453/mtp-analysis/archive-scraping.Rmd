@@ -17,19 +17,22 @@ year_urls <- c('8987534','45753152','42784428','40871902','34643492',
 year_shows <- list()
 for(i in seq(1,length(year_urls))){
   year_html <- read_html(paste0(begin,year_urls[i],end))
+  
   poss_urls <- year_html%>%
     html_nodes('span a')
+  
   year_shows[[i]] <- poss_urls%>%
     html_attr('href')%>%
     .[grepl('nbcnews.com',.)]
 }
+
 show_urls <- unlist(year_shows)
 transcript_urls <- show_urls[grepl('transcript',show_urls)]
 good_html <- list()
 for(i in seq(1,length(transcript_urls))){
   good_html[[i]] <- try(read_html(transcript_urls[i]))
 }
-transcript_urls[2]
+
 capture_text <- function(obj){
   show_text <- obj%>%
     html_nodes('div p')%>%
@@ -59,51 +62,3 @@ for(i in seq(1,length(good_html))){
 
 all_show_dfs <- bind_rows(show_df[!is.na(show_df)])
 ```
-
-Next, we split off the speaker from the thing spoken. It's not the cleanest formating because the speaker and their text comes in a single string delimited by a colon. So after extracting speaker, we need to go through and run some diagnostic checks to clean up the list of guests.
-
-```{r}
-speaker <- ifelse(grepl(':',all_show_dfs$text),
-                    unlist(lapply(strsplit(all_show_dfs$text,
-                                           ':', fixed = TRUE), '[', 1)),NA)
-shows_speakers <- data.frame(all_show_dfs, data.frame(speaker))%>%
-  do(zoo::na.locf(.))
-
-
-```
-
-```{r}
-shows_speakers%>%
-  mutate(first = ifelse(substr(speaker, 0,1)==toupper(substr(speaker,0,1)),1,0),
-         second = ifelse(substr(speaker, 1,2)==toupper(substr(speaker,1,2)),1,0),
-         third = ifelse(substr(speaker, 2,3)==toupper(substr(speaker,2,3)),1,0),
-         name_score = first+second+third)%>%
-  distinct(speaker,.keep_all = T)%>%
-  filter(name_score > 1)%>%
-  write.csv('speakers.csv', row.names = F)
-
-read_html('http://www.tvguide.com/tvshows/meet-the-press/cast/203044/')%>%
-  html_nodes('div a')%>%
-  html_text()%>%
-  trimws()
-```
-
-speaker <- ifelse(grepl(':',show_text),
-                    unlist(lapply(strsplit(show_text,
-                                           ':', fixed = TRUE), '[', 1)),NA)
-  show_df <- data.frame(show_text, speaker)%>%
-    do(zoo::na.locf(.))#%>%mutate(clean_text = str_replace(.$show_text, .$speaker, ''))
-  show_df$show_text <- gsub('[[:punct:] ]+',' ',show_df$show_text)
-  show_df$show_text <- str_replace(show_df$show_text, show_df$speaker,'')
-  show_df$show_text <- str_replace(show_df$show_text, ':','')
-  show_df$speaker <- gsub('[[:punct:] ]+',' ',show_df$speaker)
-  show_df <- show_df%>%
-    mutate(chars = nchar(trimws(show_text)))%>%
-    filter(chars>2)%>%
-    mutate(utterance = row_number(),
-           date = show_date)%>%
-    select(-chars)
-  return(
-    show_df
-         )
-}
